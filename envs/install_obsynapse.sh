@@ -43,3 +43,11 @@ conda install conda-forge::python-dotenv
 # qdrant-client: Vector database client for Qdrant
 # Alternative or additional vector store option for storing note embeddings and RAG operations
 conda install conda-forge::qdrant-client
+
+# uvicorn: ASGI web server implementation
+# Used to run the FastAPI Review Interface API server in production and development
+conda install conda-forge::uvicorn --yes
+
+# openai: Official OpenAI Python SDK
+# Used to interact with OpenAI's LLM APIs (GPT-4o, GPT-4o-mini) for the Agentic Forge flashcard generation
+conda install conda-forge::openai --yes
