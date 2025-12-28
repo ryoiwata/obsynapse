@@ -22,6 +22,7 @@ logging.basicConfig(
 # Initialize Inngest client
 inngest_client = inngest.Inngest(
     app_id="obsynapse",
+    logger=logging.getLogger("uvicorn"),
     is_production=False,
     serializer=inngest.PydanticSerializer()
 )
