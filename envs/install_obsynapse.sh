@@ -55,3 +55,7 @@ conda install conda-forge::openai --yes
 # streamlit: Interactive web application framework
 # Alternative UI option for the Review Interface to display flashcards and manage spaced repetition reviews
 conda install conda-forge::streamlit --yes
+
+# uv: Fast Python package installer and resolver (written in Rust)
+# High-performance alternative to pip for faster package installation and dependency resolution
+conda install conda-forge::uv --yes
