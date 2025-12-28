@@ -51,3 +51,7 @@ conda install conda-forge::uvicorn --yes
 # openai: Official OpenAI Python SDK
 # Used to interact with OpenAI's LLM APIs (GPT-4o, GPT-4o-mini) for the Agentic Forge flashcard generation
 conda install conda-forge::openai --yes
+
+# streamlit: Interactive web application framework
+# Alternative UI option for the Review Interface to display flashcards and manage spaced repetition reviews
+conda install conda-forge::streamlit --yes
