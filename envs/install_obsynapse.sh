@@ -27,3 +27,19 @@ conda install conda-forge::chromadb --yes
 # langchain-text-splitters: Text chunking utilities
 # Used to split markdown notes into 500-800 character chunks with 10% overlap for embedding
 conda install conda-forge::langchain-text-splitters --yes
+
+# fastapi: Modern, fast web framework for building APIs
+# Used for the Review Interface API to serve flashcards and manage the spaced repetition system
+conda install conda-forge::fastapi --yes
+
+# inngest: Event-driven workflow orchestration platform
+# Used to coordinate multi-step LLM workflows (Extractor Agent, Flashcard Architect, Pedagogical Critic)
+pip install inngest
+
+# python-dotenv: Environment variable management
+# Used to load API keys, database paths, and other configuration from .env files
+conda install conda-forge::python-dotenv
+
+# qdrant-client: Vector database client for Qdrant
+# Alternative or additional vector store option for storing note embeddings and RAG operations
+conda install conda-forge::qdrant-client
