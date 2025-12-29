@@ -61,7 +61,11 @@ def load_and_chunk_markdown(path: str) -> List[str]:
     content = post.content
 
     # Split into chunks
+    # RecursiveCharacterTextSplitter.split_text returns a list of strings
     chunks = splitter.split_text(content)
+
+    # Ensure all chunks are strings and filter out empty chunks
+    chunks = [str(chunk).strip() for chunk in chunks if chunk and str(chunk).strip()]
 
     return chunks
 

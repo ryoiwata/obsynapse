@@ -17,9 +17,18 @@ Example:
     >>> results = storage.search(query_vector=[0.1, 0.2, ...], top_k=5)
 """
 
+import json
+import uuid
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from typing import List, Dict, Any, Union
+
+# Try to import Qdrant exceptions for better error handling
+try:
+    from qdrant_client.http.exceptions import UnexpectedResponse
+except ImportError:
+    # Fallback if exception class is not available
+    UnexpectedResponse = None
 
 
 class QdrantStorage:
@@ -74,7 +83,7 @@ class QdrantStorage:
 
     def upsert(
         self,
-        ids: List[Union[str, int]],
+        ids: List[Union[str, int, uuid.UUID]],
         vectors: List[List[float]],
         payloads: List[Dict[str, Any]]
     ) -> None:
@@ -101,17 +110,91 @@ class QdrantStorage:
             ...         {"text": "Second chunk", "source": "notes/study.md"}
             ...     ]
             ... )
+        
+        Raises:
+            Exception: If Qdrant returns an error during upsert
         """
+        # Sanitize payloads to ensure all values are JSON-serializable
+        sanitized_payloads = []
+        for idx, payload in enumerate(payloads):
+            sanitized = {}
+            for key, value in payload.items():
+                # Ensure all values are JSON-serializable
+                if isinstance(value, (str, int, float, bool, type(None))):
+                    # For strings, ensure they're valid UTF-8 and not too long
+                    if isinstance(value, str):
+                        # Qdrant has limits on payload size, truncate if needed
+                        if len(value) > 50000:  # 50KB limit per field
+                            value = value[:50000]
+                        # Ensure valid UTF-8 encoding
+                        try:
+                            value.encode('utf-8').decode('utf-8')
+                        except (UnicodeEncodeError, UnicodeDecodeError):
+                            # Replace invalid characters
+                            value = value.encode('utf-8', errors='replace').decode('utf-8')
+                    sanitized[key] = value
+                elif isinstance(value, (list, dict)):
+                    # Recursively sanitize nested structures
+                    try:
+                        json.dumps(value)  # Test if serializable
+                        sanitized[key] = value
+                    except (TypeError, ValueError) as e:
+                        # If not serializable, convert to string
+                        sanitized[key] = str(value)
+                else:
+                    # Convert any other type to string
+                    sanitized[key] = str(value)
+            
+            # Validate the entire payload is JSON-serializable
+            try:
+                json.dumps(sanitized)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"Payload at index {idx} is not JSON-serializable: {e}. "
+                    f"Payload keys: {list(sanitized.keys())}"
+                ) from e
+            
+            sanitized_payloads.append(sanitized)
+        
         # Convert to PointStruct format required by Qdrant
         points = [
             PointStruct(
                 id=ids[i],
                 vector=vectors[i],
-                payload=payloads[i]
+                payload=sanitized_payloads[i]
             )
             for i in range(len(ids))
         ]
-        self.client.upsert(self.collection, points=points)
+        
+        try:
+            self.client.upsert(self.collection, points=points)
+        except Exception as e:
+            # Handle Qdrant API errors with detailed information
+            error_msg = str(e)
+            
+            # Try to extract additional error details
+            if UnexpectedResponse and isinstance(e, UnexpectedResponse):
+                status_code = getattr(e, 'status_code', 'Unknown')
+                # Use getattr with default to safely access attributes
+                reason = getattr(e, 'reason', getattr(e, 'message', 'Bad Request'))
+                error_msg = f"Unexpected Response: {status_code} ({reason})"
+                if hasattr(e, 'body') and e.body:
+                    error_msg = f"{error_msg}\nRaw response content:\n{e.body}"
+                elif hasattr(e, 'content') and e.content:
+                    error_msg = f"{error_msg}\nRaw response content:\n{e.content}"
+            elif hasattr(e, 'status_code'):
+                # Generic HTTP error
+                status_code = getattr(e, 'status_code', 'Unknown')
+                reason = getattr(e, 'reason', getattr(e, 'message', ''))
+                error_msg = f"Unexpected Response: {status_code} ({reason})"
+                if hasattr(e, 'body') and e.body:
+                    error_msg = f"{error_msg}\nRaw response content:\n{e.body}"
+                elif hasattr(e, 'content') and e.content:
+                    error_msg = f"{error_msg}\nRaw response content:\n{e.content}"
+                elif hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    error_msg = f"{error_msg}\nRaw response content:\n{e.response.text}"
+            
+            raise Exception(error_msg) from e
 
     def search(
         self,
