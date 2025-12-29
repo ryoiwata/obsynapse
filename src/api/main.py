@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 import datetime
 from pathlib import Path
 
-from src.ingestion import load_and_chunk_markdown, embed_texts, EMBED_DIM
-from src.db import QdrantStorage
+from ..ingestion import load_and_chunk_markdown, embed_texts, EMBED_DIM
+from ..db import QdrantStorage
 
 # Load environment variables
 load_dotenv()
@@ -215,6 +215,35 @@ async def root():
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+@app.post("/api/trigger/process-note")
+async def trigger_process_note(file_path: str):
+    """
+    Trigger the process_note Inngest function.
+
+    Args:
+        file_path: Path to the markdown file to process (query parameter)
+
+    Returns:
+        Event ID and status
+
+    Example:
+        POST /api/trigger/process-note?file_path=/path/to/note.md
+    """
+    # Send event to Inngest
+    event_id = inngest_client.send_sync(
+        inngest.Event(
+            name="obsynapse/note_updated",
+            data={"file_path": file_path}
+        )
+    )
+    return {
+        "status": "triggered",
+        "event_id": event_id,
+        "file_path": file_path,
+        "message": "Note processing triggered"
+    }
 
 
 # Serve Inngest functions with FastAPI
