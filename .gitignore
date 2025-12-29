@@ -2,6 +2,9 @@
 chroma_db/
 *.chroma
 
+# Qdrant database
+qdrant_storage/
+
 # Python
 __pycache__/
 *.py[cod]
