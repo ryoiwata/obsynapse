@@ -7,7 +7,7 @@ markdown notes for vector storage and RAG operations.
 
 from pathlib import Path
 from openai import OpenAI
-from llama_index.core.node_parser import SentenceSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import frontmatter
 from dotenv import load_dotenv
 from typing import List
@@ -18,7 +18,12 @@ client = OpenAI()
 EMBED_MODEL = "text-embedding-3-large"
 EMBED_DIM = 3072
 
-splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    length_function=len,
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
 
 
 def load_and_chunk_markdown(path: str) -> List[str]:

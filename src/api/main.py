@@ -4,15 +4,31 @@ FastAPI server with Inngest workflow orchestration for the Agentic Forge.
 """
 
 import logging
+import sys
+from pathlib import Path
+
+# Add project root to Python path for imports
+# This allows running from any directory (e.g., src/api/)
+_project_root = Path(__file__).parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+# Standard library imports
+import datetime
+
+# Third-party imports
+from dotenv import load_dotenv
 from fastapi import FastAPI
 import inngest
 import inngest.fast_api
-from dotenv import load_dotenv
-import datetime
-from pathlib import Path
 
-from ..ingestion import load_and_chunk_markdown, embed_texts, EMBED_DIM
-from ..db import QdrantStorage
+# Local imports (must come after sys.path modification)
+from src.ingestion import (  # noqa: E402
+    load_and_chunk_markdown,
+    embed_texts,
+    EMBED_DIM
+)
+from src.db import QdrantStorage  # noqa: E402
 
 # Load environment variables
 load_dotenv()
