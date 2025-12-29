@@ -77,9 +77,14 @@ async def process_note(ctx: inngest.Context):
 
     try:
         # Step 1: Load and chunk the markdown file
-        logger.info(f"Loading and chunking markdown file: {file_path}")
-        chunks = load_and_chunk_markdown(file_path)
-        logger.info(f"Created {len(chunks)} chunks from {file_path}")
+        # This step will be visible in the Inngest UI with chunk details
+        load_result = await ctx.step.run(
+            "load-and-chunk",
+            lambda: _load_and_chunk_step(file_path)
+        )
+
+        chunks = load_result["chunks"]
+        source_id = load_result["source_id"]
 
         if not chunks:
             logger.warning(f"No chunks extracted from {file_path}")
@@ -90,106 +95,43 @@ async def process_note(ctx: inngest.Context):
                 "message": "No content to process"
             }
 
-        # Step 2: Generate embeddings for the chunks
-        logger.info(f"Generating embeddings for {len(chunks)} chunks")
-        embeddings = embed_texts(chunks)
-        logger.info(f"Generated {len(embeddings)} embeddings")
-
-        # Step 3: Store in vector database
-        logger.info("Storing embeddings in Qdrant")
-        storage = QdrantStorage(
-            collection="obsynapse_notes",
-            dim=EMBED_DIM
-        )
-
-        # Prepare data for upsert
-        file_path_obj = Path(file_path)
-        # Use absolute path and normalize it to handle special characters
-        relative_path = str(file_path_obj.resolve())
-
-        # Generate deterministic UUID namespace from file path
-        # This ensures the same file always gets the same namespace UUID
-        path_namespace = uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            relative_path
-        )
-
-        chunk_ids = []
-        payloads = []
-
-        for i, chunk in enumerate(chunks):
-            # Create a deterministic UUID for each chunk
-            # Using UUID v5 ensures same file+chunk always gets same ID
-            chunk_id = uuid.uuid5(
-                path_namespace,
-                f"chunk_{i}"
+        # Step 2: Generate embeddings and store in vector database
+        # This step will be visible in the Inngest UI
+        embed_result = await ctx.step.run(
+            "embed-and-upsert",
+            lambda: _embed_and_upsert_step(
+                chunks=chunks,
+                source_id=source_id,
+                file_path=file_path
             )
-            chunk_ids.append(chunk_id)
+        )
 
-            # Ensure chunk text is a string and not too large
-            chunk_text = str(chunk) if chunk else ""
-            # Truncate if too long (Qdrant has limits)
-            if len(chunk_text) > 100000:  # 100KB limit
-                original_len = len(str(chunk))
-                chunk_text = chunk_text[:100000]
-                logger.warning(
-                    f"Truncated chunk {i} from {original_len} to 100000 chars"
+        # Step 3: Finalization
+        # This step completes the process
+        await ctx.step.run(
+            "finalization",
+            lambda: {
+                "status": "completed",
+                "chunks_count": len(chunks),
+                "embeddings_count": embed_result["embeddings_count"],
+                "stored_count": embed_result["stored_count"],
+                "message": (
+                    "Successfully processed and stored in vector database"
                 )
-
-            # Prepare payload - ensure all values are JSON-serializable
-            # Ensure the file path is a valid UTF-8 string
-            try:
-                # Validate that the path can be encoded/decoded
-                relative_path_clean = relative_path.encode(
-                    'utf-8'
-                ).decode('utf-8')
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                # Fallback: use a normalized version
-                relative_path_clean = str(file_path_obj)
-
-            payload = {
-                "text": chunk_text,
-                "source": relative_path_clean,
-                # Qdrant prefers strings for metadata
-                "chunk_index": str(i)
             }
-            payloads.append(payload)
+        )
 
-        # Upsert in batches to avoid overwhelming Qdrant
-        batch_size = 100
-        for i in range(0, len(chunk_ids), batch_size):
-            batch_ids = chunk_ids[i:i + batch_size]
-            batch_vectors = embeddings[i:i + batch_size]
-            batch_payloads = payloads[i:i + batch_size]
-
-            batch_num = i // batch_size + 1
-            logger.info(
-                f"Upserting batch {batch_num} ({len(batch_ids)} chunks)"
-            )
-            try:
-                storage.upsert(
-                    ids=batch_ids,
-                    vectors=batch_vectors,
-                    payloads=batch_payloads
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error upserting batch {batch_num}: {e}",
-                    exc_info=True
-                )
-                raise
-        logger.info(f"Stored {len(chunks)} chunks in vector database")
-
-        # Step 4: Trigger next step in workflow (concept extraction)
-        # This will be implemented when the Extractor Agent is ready
         logger.info("Note processing complete, ready for concept extraction")
 
         return {
             "file_path": file_path,
             "status": "processed",
             "chunks_count": len(chunks),
-            "embeddings_count": len(embeddings),
-            "message": "Successfully processed and stored in vector database"
+            "embeddings_count": embed_result["embeddings_count"],
+            "stored_count": embed_result["stored_count"],
+            "message": (
+                "Successfully processed and stored in vector database"
+            )
         }
 
     except FileNotFoundError as e:
@@ -206,6 +148,136 @@ async def process_note(ctx: inngest.Context):
             "status": "error",
             "error": str(e)
         }
+
+
+def _load_and_chunk_step(file_path: str) -> dict:
+    """
+    Helper function for the load-and-chunk step.
+    Returns chunks and source ID for visibility in Inngest UI.
+    """
+    logger = logging.getLogger("obsynapse.process_note.load_and_chunk")
+    logger.info(f"Loading and chunking markdown file: {file_path}")
+
+    chunks = load_and_chunk_markdown(file_path)
+    logger.info(f"Created {len(chunks)} chunks from {file_path}")
+
+    file_path_obj = Path(file_path)
+    source_id = str(file_path_obj.resolve())
+
+    # Return result with chunks visible in UI
+    # Limit chunk preview to first 500 chars for UI display
+    chunk_previews = [
+        (chunk[:500] + "..." if len(chunk) > 500 else chunk)
+        for chunk in chunks[:10]  # Show first 10 chunks
+    ]
+
+    return {
+        "chunks": chunks,
+        "chunks_count": len(chunks),
+        "source_id": source_id,
+        "chunk_previews": chunk_previews,
+        "total_previewed": min(10, len(chunks))
+    }
+
+
+def _embed_and_upsert_step(
+    chunks: list,
+    source_id: str,
+    file_path: str
+) -> dict:
+    """
+    Helper function for the embed-and-upsert step.
+    Generates embeddings and stores them in Qdrant.
+    """
+    logger = logging.getLogger("obsynapse.process_note.embed_and_upsert")
+    logger.info(f"Generating embeddings for {len(chunks)} chunks")
+
+    # Generate embeddings
+    embeddings = embed_texts(chunks)
+    logger.info(f"Generated {len(embeddings)} embeddings")
+
+    # Initialize storage
+    storage = QdrantStorage(
+        collection="obsynapse_notes",
+        dim=EMBED_DIM
+    )
+
+    # Prepare data for upsert
+    file_path_obj = Path(file_path)
+    relative_path = source_id
+
+    # Generate deterministic UUID namespace from file path
+    path_namespace = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        relative_path
+    )
+
+    chunk_ids = []
+    payloads = []
+
+    for i, chunk in enumerate(chunks):
+        # Create a deterministic UUID for each chunk
+        chunk_id = uuid.uuid5(
+            path_namespace,
+            f"chunk_{i}"
+        )
+        chunk_ids.append(chunk_id)
+
+        # Ensure chunk text is a string and not too large
+        chunk_text = str(chunk) if chunk else ""
+        if len(chunk_text) > 100000:  # 100KB limit
+            original_len = len(str(chunk))
+            chunk_text = chunk_text[:100000]
+            logger.warning(
+                f"Truncated chunk {i} from {original_len} to 100000 chars"
+            )
+
+        # Prepare payload
+        try:
+            relative_path_clean = relative_path.encode('utf-8').decode('utf-8')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            relative_path_clean = str(file_path_obj)
+
+        payload = {
+            "text": chunk_text,
+            "source": relative_path_clean,
+            "chunk_index": str(i)
+        }
+        payloads.append(payload)
+
+    # Upsert in batches
+    batch_size = 100
+    total_stored = 0
+    for i in range(0, len(chunk_ids), batch_size):
+        batch_ids = chunk_ids[i:i + batch_size]
+        batch_vectors = embeddings[i:i + batch_size]
+        batch_payloads = payloads[i:i + batch_size]
+
+        batch_num = i // batch_size + 1
+        logger.info(
+            f"Upserting batch {batch_num} ({len(batch_ids)} chunks)"
+        )
+        try:
+            storage.upsert(
+                ids=batch_ids,
+                vectors=batch_vectors,
+                payloads=batch_payloads
+            )
+            total_stored += len(batch_ids)
+        except Exception as e:
+            logger.error(
+                f"Error upserting batch {batch_num}: {e}",
+                exc_info=True
+            )
+            raise
+
+    logger.info(f"Stored {total_stored} chunks in vector database")
+
+    return {
+        "embeddings_count": len(embeddings),
+        "stored_count": total_stored,
+        "batches_processed": (len(chunk_ids) + batch_size - 1) // batch_size
+    }
 
 
 @inngest_client.create_function(
