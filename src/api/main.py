@@ -9,6 +9,10 @@ import inngest
 import inngest.fast_api
 from dotenv import load_dotenv
 import datetime
+from pathlib import Path
+
+from src.ingestion import load_and_chunk_markdown, embed_texts, EMBED_DIM
+from src.db import QdrantStorage
 
 # Load environment variables
 load_dotenv()
@@ -35,22 +39,113 @@ inngest_client = inngest.Inngest(
 async def process_note(ctx: inngest.Context):
     """
     Process a note that was updated in the vault.
-    Extracts atomic concepts and triggers flashcard generation.
+
+    Loads the markdown file, chunks it, generates embeddings, and stores
+    them in the vector database. This is the first step in the ingestion
+    pipeline.
     """
     event_data = ctx.event.data
     file_path = event_data.get("file_path")
-    # TODO: Extract and use content for atomic concept identification
 
     logger = logging.getLogger("obsynapse.process_note")
     logger.info(f"Processing note: {file_path}")
 
-    # TODO: Implement Extractor Agent to identify atomic concepts
-    # For now, return placeholder
-    return {
-        "file_path": file_path,
-        "status": "processed",
-        "concepts_extracted": []
-    }
+    if not file_path:
+        logger.error("No file_path provided in event data")
+        return {
+            "file_path": None,
+            "status": "error",
+            "error": "Missing file_path"
+        }
+
+    try:
+        # Step 1: Load and chunk the markdown file
+        logger.info(f"Loading and chunking markdown file: {file_path}")
+        chunks = await ctx.run(
+            "load_and_chunk",
+            lambda: load_and_chunk_markdown(file_path)
+        )
+        logger.info(f"Created {len(chunks)} chunks from {file_path}")
+
+        if not chunks:
+            logger.warning(f"No chunks extracted from {file_path}")
+            return {
+                "file_path": file_path,
+                "status": "processed",
+                "chunks_count": 0,
+                "message": "No content to process"
+            }
+
+        # Step 2: Generate embeddings for the chunks
+        logger.info(f"Generating embeddings for {len(chunks)} chunks")
+        embeddings = await ctx.run(
+            "generate_embeddings",
+            lambda: embed_texts(chunks)
+        )
+        logger.info(f"Generated {len(embeddings)} embeddings")
+
+        # Step 3: Store in vector database
+        logger.info("Storing embeddings in Qdrant")
+        storage = await ctx.run(
+            "init_storage",
+            lambda: QdrantStorage(
+                collection="obsynapse_notes",
+                dim=EMBED_DIM
+            )
+        )
+
+        # Prepare data for upsert
+        file_path_obj = Path(file_path)
+        relative_path = str(file_path_obj)
+        chunk_ids = [
+            f"{relative_path}__chunk_{i}"
+            for i in range(len(chunks))
+        ]
+        payloads = [
+            {
+                "text": chunk,
+                "source": relative_path,
+                "chunk_index": i
+            }
+            for i, chunk in enumerate(chunks)
+        ]
+
+        await ctx.run(
+            "upsert_vectors",
+            lambda: storage.upsert(
+                ids=chunk_ids,
+                vectors=embeddings,
+                payloads=payloads
+            )
+        )
+        logger.info(f"Stored {len(chunks)} chunks in vector database")
+
+        # Step 4: Trigger next step in workflow (concept extraction)
+        # This will be implemented when the Extractor Agent is ready
+        logger.info("Note processing complete, ready for concept extraction")
+
+        return {
+            "file_path": file_path,
+            "status": "processed",
+            "chunks_count": len(chunks),
+            "embeddings_count": len(embeddings),
+            "message": "Successfully processed and stored in vector database"
+        }
+
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        return {
+            "file_path": file_path,
+            "status": "error",
+            "error": str(e)
+        }
+    except Exception as e:
+        logger.error(f"Error processing note {file_path}: {e}", exc_info=True)
+        return {
+            "file_path": file_path,
+            "status": "error",
+            "error": str(e)
+        }
 
 
 @inngest_client.create_function(
