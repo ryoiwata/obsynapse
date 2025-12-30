@@ -30,9 +30,9 @@ class PDFExtractor:
     MONOSPACED_FONTS = {'courier', 'mono', 'monospace', 'consolas', 'fixed'}
 
     # Thresholds for header/footer detection
-    # PAGE_EDGE_THRESHOLD: 10% of page height from top/bottom
-    # Increased to catch headers/footers that sit deeper in the margins
-    PAGE_EDGE_THRESHOLD = 0.10
+    # PAGE_EDGE_THRESHOLD: 8% of page height from top/bottom
+    # Set to catch headers/footers while minimizing false positives
+    PAGE_EDGE_THRESHOLD = 0.08
     # MAX_HEADER_FOOTER_LENGTH: Maximum characters for header/footer
     # Short text in edge zones is filtered to avoid deleting real paragraphs
     # near margins
@@ -79,6 +79,10 @@ class PDFExtractor:
         - "Text | Number" (e.g., "The Rise of AI Engineering | 15")
         - Solo page numbers (e.g., "1", "2", "123")
 
+        Sentence protection: Text ending with sentence-terminal punctuation
+        ('.', '!', '?') is never filtered, even if short and in edge zones.
+        This protects valid sentence fragments from being deleted.
+
         Args:
             text: Text content to check
             y_pos: Y-coordinate of the text block (top of block)
@@ -87,13 +91,14 @@ class PDFExtractor:
         Returns:
             True if the text is likely a header or footer and should be
             filtered out. Returns True immediately if a regex pattern matches.
+            Returns False if text ends with sentence punctuation (protected).
         """
         # Positional filtering: check if in edge zone first
         relative_y = y_pos / page_height
         is_near_top = relative_y < self.PAGE_EDGE_THRESHOLD
         is_near_bottom = relative_y > (1 - self.PAGE_EDGE_THRESHOLD)
 
-        # Must be in edge zone (top 10% or bottom 10%) to be considered
+        # Must be in edge zone (top 8% or bottom 8%) to be considered
         if not (is_near_top or is_near_bottom):
             return False
 
@@ -122,7 +127,14 @@ class PDFExtractor:
         if pattern_solo_number.match(text_stripped):
             return True
 
+        # Sentence protection: if text ends with sentence-terminal punctuation,
+        # treat it as valid content, not a header/footer
+        # This protects real sentences that happen to be short and near edges
+        if text_stripped.endswith(('.', '!', '?')):
+            return False
+
         # Fallback: short text in edge zones is filtered
+        # Only apply length check if text doesn't look like a sentence
         # (e.g., < 150 characters)
         return len(text_stripped) <= self.MAX_HEADER_FOOTER_LENGTH
 
@@ -440,7 +452,7 @@ class PDFExtractor:
 
         Processes pages individually to preserve correct reading order.
         Headers and footers are automatically removed based on positional
-        filtering (top/bottom 5% of page) and regex pattern matching.
+        filtering (top/bottom 8% of page) and regex pattern matching.
 
         Each page is fully processed (extract, filter, sort, group) before
         moving to the next page. This prevents text from different pages
