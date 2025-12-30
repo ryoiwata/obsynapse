@@ -30,9 +30,9 @@ class PDFExtractor:
     MONOSPACED_FONTS = {'courier', 'mono', 'monospace', 'consolas', 'fixed'}
 
     # Thresholds for header/footer detection
-    # PAGE_EDGE_THRESHOLD: 8% of page height from top/bottom
-    # Set to catch headers/footers while minimizing false positives
-    PAGE_EDGE_THRESHOLD = 0.08
+    # PAGE_EDGE_THRESHOLD: 12% of page height from top/bottom
+    # Expanded to catch headers/footers in books with large margins
+    PAGE_EDGE_THRESHOLD = 0.12
     # MAX_HEADER_FOOTER_LENGTH: Maximum characters for header/footer
     # Short text in edge zones is filtered to avoid deleting real paragraphs
     # near margins
@@ -69,19 +69,23 @@ class PDFExtractor:
         """
         Determine if a text block is likely a header or footer.
 
-        Uses positional filtering: checks if block is in the edge zone
-        (top/bottom PAGE_EDGE_THRESHOLD) AND matches specific header/footer
-        patterns or has short text length.
+        Prioritizes regex pattern matching: checks for header/footer patterns
+        FIRST, before coordinate checks. If a pattern matches, the text is
+        filtered regardless of position (though coordinate check provides
+        safety net).
 
-        Strictly enforces removal of lines matching these patterns when in
-        edge zones:
-        - "Number | Text" (e.g., "10 | Chapter 1...")
+        Strictly enforces removal of lines matching these patterns:
+        - "Number | Text" (e.g., "10 | Chapter 1...", "14 | Chapter 1...")
         - "Text | Number" (e.g., "The Rise of AI Engineering | 15")
         - Solo page numbers (e.g., "1", "2", "123")
 
+        Patterns support both standard pipe (|) and Unicode box-drawing
+        pipe (│) characters that sometimes appear in PDFs.
+
         Sentence protection: Text ending with sentence-terminal punctuation
-        ('.', '!', '?') is never filtered, even if short and in edge zones.
-        This protects valid sentence fragments from being deleted.
+        ('.', '!', '?') or a hyphen ('-') is never filtered, even if short
+        and in edge zones. This protects valid sentence fragments and
+        hyphenated word fragments from being deleted.
 
         Args:
             text: Text content to check
@@ -91,51 +95,66 @@ class PDFExtractor:
         Returns:
             True if the text is likely a header or footer and should be
             filtered out. Returns True immediately if a regex pattern matches.
-            Returns False if text ends with sentence punctuation (protected).
+            Returns False if text ends with sentence punctuation or hyphen
+            (protected).
         """
-        # Positional filtering: check if in edge zone first
-        relative_y = y_pos / page_height
-        is_near_top = relative_y < self.PAGE_EDGE_THRESHOLD
-        is_near_bottom = relative_y > (1 - self.PAGE_EDGE_THRESHOLD)
-
-        # Must be in edge zone (top 8% or bottom 8%) to be considered
-        if not (is_near_top or is_near_bottom):
-            return False
-
-        # If in edge zone, check for specific header/footer patterns
+        # Strip text first for pattern matching
         text_stripped = text.strip()
         if not text_stripped:
             return False
 
+        # PRIORITY: Check regex patterns FIRST, before coordinate checks
+        # This ensures pipe patterns are caught regardless of exact position
         # Regex patterns for specific header/footer formats
-        # These patterns are strictly enforced - if matched, return True
-        # immediately to filter out the block
-        # More resilient patterns to handle fragmenting and spacing
+        # Flexible patterns supporting both | and │ characters
         # Pattern 1: "Number | Text" (e.g., "10 | Chapter 1...")
-        pattern_number_text = re.compile(r'^\d+\s*[|]\s*.*', re.IGNORECASE)
+        pattern_number_text = re.compile(r'^\d+\s*[|│]\s*.*', re.IGNORECASE)
         # Pattern 2: "Text | Number" (e.g., "The Rise of AI Engineering | 15")
-        pattern_text_number = re.compile(r'.*\s*[|]\s*\d+$', re.IGNORECASE)
+        # Uses non-greedy match to ensure proper matching from start
+        pattern_text_number = re.compile(r'^.*?\s*[|│]\s*\d+$', re.IGNORECASE)
         # Pattern 3: Solo page numbers (e.g., "1", "2", "123")
         pattern_solo_number = re.compile(r'^\d+$')
 
-        # Strict enforcement: if text matches any pattern, return True
-        # immediately to filter it out
+        # If text matches any pattern, check if it's in edge zone
+        # (safety net) but prioritize pattern match
+        pattern_matched = False
         if pattern_number_text.match(text_stripped):
-            return True
-        if pattern_text_number.match(text_stripped):
-            return True
-        if pattern_solo_number.match(text_stripped):
+            pattern_matched = True
+        elif pattern_text_number.match(text_stripped):
+            pattern_matched = True
+        elif pattern_solo_number.match(text_stripped):
+            pattern_matched = True
+
+        # If pattern matched, check coordinate as safety net
+        if pattern_matched:
+            relative_y = y_pos / page_height
+            is_near_top = relative_y < self.PAGE_EDGE_THRESHOLD
+            is_near_bottom = relative_y > (1 - self.PAGE_EDGE_THRESHOLD)
+            # If in edge zone (top/bottom 12%), definitely filter
+            # If pattern matches but outside edge zone, still filter
+            # (pattern match takes priority)
             return True
 
-        # Sentence protection: if text ends with sentence-terminal punctuation,
-        # treat it as valid content, not a header/footer
-        # This protects real sentences that happen to be short and near edges
-        if text_stripped.endswith(('.', '!', '?')):
+        # Positional filtering: check if in edge zone
+        relative_y = y_pos / page_height
+        is_near_top = relative_y < self.PAGE_EDGE_THRESHOLD
+        is_near_bottom = relative_y > (1 - self.PAGE_EDGE_THRESHOLD)
+
+        # Must be in edge zone (top 12% or bottom 12%) for other checks
+        if not (is_near_top or is_near_bottom):
+            return False
+
+        # Sentence protection: if text ends with sentence-terminal punctuation
+        # or a hyphen, treat it as valid content, not a header/footer
+        # This protects real sentences and hyphenated word fragments that
+        # happen to be short and near edges
+        # Check happens BEFORE the length-based fallback to ensure protection
+        if text_stripped.endswith(('.', '!', '?', '-')):
             return False
 
         # Fallback: short text in edge zones is filtered
         # Only apply length check if text doesn't look like a sentence
-        # (e.g., < 150 characters)
+        # or hyphenated word fragment (e.g., < 150 characters)
         return len(text_stripped) <= self.MAX_HEADER_FOOTER_LENGTH
 
     def _extract_text_blocks(self, page) -> List[Dict]:
@@ -146,11 +165,15 @@ class PDFExtractor:
         adding individual spans. This ensures fragmented spans like "14" and
         "| Chapter 1" are reunited before the regex check runs.
 
+        Headers/footers flagged by regex patterns are completely excluded
+        before the paragraph grouping phase, ensuring clean extraction.
+
         Args:
             page: PyMuPDF page object
 
         Returns:
             List of text block dictionaries with position and formatting info
+            (headers/footers already excluded)
         """
         text_dict = page.get_text('dict')
         blocks = []
@@ -195,7 +218,9 @@ class PDFExtractor:
 
                 # Concatenate all spans in the line to form full line text
                 if line_text_parts and line_y_pos is not None:
-                    full_line_text = ' '.join(line_text_parts)
+                    # Strip to ensure regex isn't defeated by leading/trailing
+                    # whitespace
+                    full_line_text = ' '.join(line_text_parts).strip()
 
                     # Check if the entire line is a header/footer
                     # Only add spans if the line is NOT a header/footer
@@ -309,6 +334,11 @@ class PDFExtractor:
     ) -> Tuple[bool, bool]:
         """
         Determine if two paragraphs from consecutive pages should be merged.
+
+        Ensures seamless merging when headers/footers are removed. If the
+        previous page ends without terminal punctuation ('.', '!', '?') or
+        ends with a hyphen ('-'), paragraphs MUST be merged into a single
+        continuous paragraph so the removed header doesn't leave a gap.
 
         Args:
             last_paragraph: Last paragraph from previous page
@@ -452,7 +482,7 @@ class PDFExtractor:
 
         Processes pages individually to preserve correct reading order.
         Headers and footers are automatically removed based on positional
-        filtering (top/bottom 8% of page) and regex pattern matching.
+        filtering (top/bottom 12% of page) and regex pattern matching.
 
         Each page is fully processed (extract, filter, sort, group) before
         moving to the next page. This prevents text from different pages
