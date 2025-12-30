@@ -1,0 +1,6 @@
+default_run:
+  model_name: "gpt-4o-mini"
+  system_prompt_file: "prompts/flashcards_system_v1_0.txt"
+  user_prompt_file: "prompts/flashcards_user_v1_0.txt"
+  version: "1.0.0"
+
