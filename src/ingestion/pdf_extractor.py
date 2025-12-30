@@ -30,9 +30,9 @@ class PDFExtractor:
     MONOSPACED_FONTS = {'courier', 'mono', 'monospace', 'consolas', 'fixed'}
 
     # Thresholds for header/footer detection
-    # PAGE_EDGE_THRESHOLD: 12% of page height from top/bottom
-    # Expanded to catch headers/footers in books with large margins
-    PAGE_EDGE_THRESHOLD = 0.12
+    # PAGE_EDGE_THRESHOLD: 5% of page height from top/bottom
+    # Set to catch headers/footers while minimizing false positives
+    PAGE_EDGE_THRESHOLD = 0.05
     # MAX_HEADER_FOOTER_LENGTH: Maximum characters for header/footer
     # Short text in edge zones is filtered to avoid deleting real paragraphs
     # near margins
@@ -76,8 +76,14 @@ class PDFExtractor:
 
         Strictly enforces removal of lines matching these patterns:
         - "Number | Text" (e.g., "10 | Chapter 1...", "14 | Chapter 1...")
-        - "Text | Number" (e.g., "The Rise of AI Engineering | 15")
+        - "Text | Number" or "Text Number" (e.g.,
+          "The Rise of AI Engineering | 15" or
+          "The Rise of AI Engineering 3")
         - Solo page numbers (e.g., "1", "2", "123")
+        - "| Text" (e.g., "| Chapter 1...")
+        - Chapter titles in header/footer zones
+          (e.g., "Chapter 1: Introduction...")
+        - Title case section headers in extreme margins
 
         Patterns support both standard pipe (|) and Unicode box-drawing
         pipe (│) characters that sometimes appear in PDFs.
@@ -103,44 +109,105 @@ class PDFExtractor:
         if not text_stripped:
             return False
 
+        # DEBUG: Log input text for troubleshooting
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            f'_is_header_or_footer: Checking text="{text_stripped[:100]}" '
+            f'(y_pos={y_pos:.1f}, page_height={page_height:.1f})'
+        )
+
         # PRIORITY: Check regex patterns FIRST, before coordinate checks
         # This ensures pipe patterns are caught regardless of exact position
         # Regex patterns for specific header/footer formats
         # Flexible patterns supporting both | and │ characters
+
         # Pattern 1: "Number | Text" (e.g., "10 | Chapter 1...")
         pattern_number_text = re.compile(r'^\d+\s*[|│]\s*.*', re.IGNORECASE)
-        # Pattern 2: "Text | Number" (e.g., "The Rise of AI Engineering | 15")
+        # Pattern 2: "Text | Number" or "Text Number" (pipe optional)
+        # Matches "The Rise of AI Engineering | 15" or
+        # "The Rise of AI Engineering 3"
         # Uses non-greedy match to ensure proper matching from start
-        pattern_text_number = re.compile(r'^.*?\s*[|│]\s*\d+$', re.IGNORECASE)
+        pattern_text_number = re.compile(
+            r'^.*?\s+(?:[|│]\s*)?\d+$',
+            re.IGNORECASE
+        )
         # Pattern 3: Solo page numbers (e.g., "1", "2", "123")
         pattern_solo_number = re.compile(r'^\d+$')
+        # Pattern 4: "| Text" (e.g., "| Chapter 1...") - pipe at start
+        pattern_pipe_text = re.compile(r'^[|│]\s*.*', re.IGNORECASE)
+        # Pattern 5: Chapter titles (e.g., "CHAPTER 1", "Chapter 1:")
+        # This catches chapter headers that appear without pipes
+        pattern_chapter = re.compile(
+            r'^CHAPTER\s+\d+|^Chapter\s+\d+',
+            re.IGNORECASE
+        )
+        # Pattern 6: Title case section headers
+        # (e.g., "The Rise of AI Engineering")
+        # Matches text starting with capital letter, containing only letters,
+        # spaces, apostrophes, and hyphens
+        # Only applies in extreme margins to avoid deleting body text
+        pattern_section_header = re.compile(
+            r'^[A-Z][a-zA-Z\s\'-]+$'
+        )
+
+        # Calculate relative position once for all pattern checks
+        relative_y = y_pos / page_height
 
         # If text matches any pattern, check if it's in edge zone
         # (safety net) but prioritize pattern match
         pattern_matched = False
+        matched_pattern = None
+
         if pattern_number_text.match(text_stripped):
             pattern_matched = True
+            matched_pattern = 'number_text'
         elif pattern_text_number.match(text_stripped):
             pattern_matched = True
+            matched_pattern = 'text_number'
         elif pattern_solo_number.match(text_stripped):
             pattern_matched = True
+            matched_pattern = 'solo_number'
+        elif pattern_pipe_text.match(text_stripped):
+            pattern_matched = True
+            matched_pattern = 'pipe_text'
+        elif pattern_chapter.match(text_stripped):
+            # Chapter pattern applies in both header (top 10%)
+            # and footer (bottom 10%)
+            if relative_y < 0.10 or relative_y > 0.90:
+                pattern_matched = True
+                matched_pattern = 'chapter_title'
+        elif pattern_section_header.match(text_stripped):
+            # Section header pattern only applies in extreme margins
+            # (< 5% or > 95%) to avoid deleting body text
+            if relative_y < 0.05 or relative_y > 0.95:
+                pattern_matched = True
+                matched_pattern = 'section_header'
 
-        # If pattern matched, check coordinate as safety net
+        # DEBUG: Log pattern matching results
+        logger.debug(
+            f'_is_header_or_footer: pattern_matched={pattern_matched}, '
+            f'matched_pattern={matched_pattern}'
+        )
+
+        # If pattern matched, filter it out
+        # Pattern matches take priority and filter regardless of exact position
         if pattern_matched:
-            relative_y = y_pos / page_height
             is_near_top = relative_y < self.PAGE_EDGE_THRESHOLD
             is_near_bottom = relative_y > (1 - self.PAGE_EDGE_THRESHOLD)
-            # If in edge zone (top/bottom 12%), definitely filter
-            # If pattern matches but outside edge zone, still filter
-            # (pattern match takes priority)
-            return True
+            # Pattern match takes priority - filter it out
+            result = True
+            logger.debug(
+                f'_is_header_or_footer: Pattern matched, filtering out. '
+                f'relative_y={relative_y:.3f}, is_near_top={is_near_top}, '
+                f'is_near_bottom={is_near_bottom}'
+            )
+            return result
 
         # Positional filtering: check if in edge zone
-        relative_y = y_pos / page_height
         is_near_top = relative_y < self.PAGE_EDGE_THRESHOLD
         is_near_bottom = relative_y > (1 - self.PAGE_EDGE_THRESHOLD)
 
-        # Must be in edge zone (top 12% or bottom 12%) for other checks
+        # Must be in edge zone (top 5% or bottom 5%) for other checks
         if not (is_near_top or is_near_bottom):
             return False
 
@@ -155,7 +222,13 @@ class PDFExtractor:
         # Fallback: short text in edge zones is filtered
         # Only apply length check if text doesn't look like a sentence
         # or hyphenated word fragment (e.g., < 150 characters)
-        return len(text_stripped) <= self.MAX_HEADER_FOOTER_LENGTH
+        result = len(text_stripped) <= self.MAX_HEADER_FOOTER_LENGTH
+        logger.debug(
+            f'_is_header_or_footer: Positional check result={result}, '
+            f'text_length={len(text_stripped)}, '
+            f'max_length={self.MAX_HEADER_FOOTER_LENGTH}'
+        )
+        return result
 
     def _extract_text_blocks(self, page) -> List[Dict]:
         """
@@ -222,11 +295,23 @@ class PDFExtractor:
                     # whitespace
                     full_line_text = ' '.join(line_text_parts).strip()
 
+                    # DEBUG: Log full line text before checking
+                    logger = logging.getLogger(__name__)
+                    logger.debug(
+                        f'_extract_text_blocks: Checking line: '
+                        f'"{full_line_text[:100]}"'
+                    )
+
                     # Check if the entire line is a header/footer
                     # Only add spans if the line is NOT a header/footer
-                    if not self._is_header_or_footer(
+                    is_header_footer = self._is_header_or_footer(
                         full_line_text, line_y_pos, page_height
-                    ):
+                    )
+                    logger.debug(
+                        f'_extract_text_blocks: '
+                        f'Line filtered={is_header_footer}'
+                    )
+                    if not is_header_footer:
                         # Line is not a header/footer, add all spans
                         blocks.extend(line_spans)
 
@@ -482,7 +567,7 @@ class PDFExtractor:
 
         Processes pages individually to preserve correct reading order.
         Headers and footers are automatically removed based on positional
-        filtering (top/bottom 12% of page) and regex pattern matching.
+        filtering (top/bottom 5% of page) and regex pattern matching.
 
         Each page is fully processed (extract, filter, sort, group) before
         moving to the next page. This prevents text from different pages
@@ -796,6 +881,92 @@ def setup_logging(
     logger.debug(f'Error log: {error_log_file}')
 
     return logger
+
+
+def test_regex_patterns():
+    """
+    Test regex patterns against problematic header/footer text.
+
+    This function tests the regex patterns used in _is_header_or_footer()
+    to verify they correctly match header/footer formats.
+    """
+    import re
+
+    # Define patterns (same as in _is_header_or_footer)
+    pattern_number_text = re.compile(r'^\d+\s*[|│]\s*.*', re.IGNORECASE)
+    pattern_text_number = re.compile(r'^.*?\s*[|│]\s*\d+$', re.IGNORECASE)
+    pattern_solo_number = re.compile(r'^\d+$')
+    pattern_pipe_text = re.compile(r'^[|│]\s*.*', re.IGNORECASE)
+
+    # Test cases
+    test_cases = [
+        # (text, expected_to_match, description)
+        ("14 | Chapter 1: Introduction", True, "Number-pipe-text format"),
+        ("The Rise of AI Engineering | 15", True, "Text-pipe-number format"),
+        ("123", True, "Solo page number"),
+        (
+            "| Chapter 1: Introduction to Building AI Applications with "
+            "Foundation Models Factor",
+            True,
+            "Pipe-text format (problematic case)"
+        ),
+        ("│ Chapter 1: Introduction", True, "Unicode pipe-text format"),
+        ("10 | Chapter 1...", True, "Number-pipe-text with ellipsis"),
+        ("Chapter 1: Introduction", False, "Regular text (should not match)"),
+        (
+            "This is a normal paragraph.",
+            False,
+            "Normal sentence (should not match)"
+        ),
+        ("|", True, "Just a pipe (edge case)"),
+    ]
+
+    print("Testing regex patterns for header/footer detection:")
+    print("=" * 80)
+
+    all_passed = True
+    for text, expected_match, description in test_cases:
+        text_stripped = text.strip()
+        matches = (
+            pattern_number_text.match(text_stripped) or
+            pattern_text_number.match(text_stripped) or
+            pattern_solo_number.match(text_stripped) or
+            pattern_pipe_text.match(text_stripped)
+        )
+
+        # Determine which pattern matched
+        matched_pattern = None
+        if pattern_number_text.match(text_stripped):
+            matched_pattern = 'number_text'
+        elif pattern_text_number.match(text_stripped):
+            matched_pattern = 'text_number'
+        elif pattern_solo_number.match(text_stripped):
+            matched_pattern = 'solo_number'
+        elif pattern_pipe_text.match(text_stripped):
+            matched_pattern = 'pipe_text'
+
+        status = "✓" if (matches == expected_match) else "✗"
+        if matches != expected_match:
+            all_passed = False
+
+        print(f"{status} {description}")
+        if len(text_stripped) > 60:
+            display_text = f"'{text_stripped[:60]}...'"
+        else:
+            display_text = f"'{text_stripped}'"
+        print(f"  Text: {display_text}")
+        print(f"  Expected: {'MATCH' if expected_match else 'NO MATCH'}, "
+              f"Got: {'MATCH' if matches else 'NO MATCH'}")
+        if matched_pattern:
+            print(f"  Matched pattern: {matched_pattern}")
+        print()
+
+    print("=" * 80)
+    if all_passed:
+        print("All tests PASSED")
+    else:
+        print("Some tests FAILED")
+    return all_passed
 
 
 def main():
