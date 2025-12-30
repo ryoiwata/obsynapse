@@ -1,4 +1,0 @@
-"""
-ObSynapse source package.
-"""
-
