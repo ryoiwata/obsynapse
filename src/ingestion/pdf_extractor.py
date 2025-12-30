@@ -394,8 +394,47 @@ class PDFExtractor:
         if not paragraph:
             return False, 0
 
-        # Headers are typically short (single line or very few words)
+        # Extract full text of the paragraph
         paragraph_text = ' '.join(block['text'] for block in paragraph).strip()
+
+        # Exclude table and figure captions from being treated as headers
+        # Check if text starts with common caption labels (case-insensitive)
+        labels_to_exclude = (
+            'table', 'figure', 'image', 'chart', 'graph',
+            'input', 'output', 'context', 'token', 'description'
+        )
+        paragraph_text_lower = paragraph_text.lower()
+        if any(
+            paragraph_text_lower.startswith(label)
+            for label in labels_to_exclude
+        ):
+            return False, 0
+
+        # Heuristic: If it contains parentheses or common table delimiters,
+        # it's likely a table header, not a section title
+        if (
+            '(' in paragraph_text or
+            ')' in paragraph_text or
+            '|' in paragraph_text
+        ):
+            return False, 0
+
+        # Check for multiple distinct bold spans (table headers often have
+        # multiple bold words separated by non-bold text)
+        bold_blocks = [
+            block for block in paragraph
+            if block.get('is_bold', False)
+        ]
+        non_bold_blocks = [
+            block for block in paragraph
+            if not block.get('is_bold', False)
+        ]
+        # If there are multiple bold spans with non-bold text between them,
+        # it's likely a table header
+        if len(bold_blocks) >= 2 and len(non_bold_blocks) > 0:
+            return False, 0
+
+        # Headers are typically short (single line or very few words)
         word_count = len(paragraph_text.split())
 
         # Headers are usually 1-15 words
