@@ -25,8 +25,9 @@ import inngest.fast_api
 
 # Local imports (must come after sys.path modification)
 from src.ingestion import (  # noqa: E402
-    load_and_chunk_markdown,
     embed_texts,
+    extract_structure,
+    chunk_from_structure,
     EMBED_DIM
 )
 from src.db import QdrantStorage  # noqa: E402
@@ -76,7 +77,19 @@ async def process_note(ctx: inngest.Context):
         }
 
     try:
-        # Step 1: Load and chunk the markdown file
+        # Step 1: Extract document structure (sections, blocks, frontmatter)
+        # This step parses the markdown into a structured IR
+        structure_result = await ctx.step.run(
+            "extract-structure",
+            lambda: _extract_structure_step(file_path)
+        )
+
+        source_id = structure_result["source_id"]
+        sections_count = structure_result["sections_count"]
+        # Note: We don't need the full structure for embedding,
+        # just the source_id and metadata
+
+        # Step 2: Load and chunk the markdown file
         # This step will be visible in the Inngest UI with chunk details
         load_result = await ctx.step.run(
             "load-and-chunk",
@@ -84,7 +97,7 @@ async def process_note(ctx: inngest.Context):
         )
 
         chunks = load_result["chunks"]
-        source_id = load_result["source_id"]
+        chunk_metadata = load_result.get("chunk_metadata", [])
 
         if not chunks:
             logger.warning(f"No chunks extracted from {file_path}")
@@ -92,27 +105,30 @@ async def process_note(ctx: inngest.Context):
                 "file_path": file_path,
                 "status": "processed",
                 "chunks_count": 0,
+                "sections_count": sections_count,
                 "message": "No content to process"
             }
 
-        # Step 2: Generate embeddings and store in vector database
+        # Step 3: Generate embeddings and store in vector database
         # This step will be visible in the Inngest UI
         embed_result = await ctx.step.run(
             "embed-and-upsert",
             lambda: _embed_and_upsert_step(
                 chunks=chunks,
+                chunk_metadata=chunk_metadata,
                 source_id=source_id,
                 file_path=file_path
             )
         )
 
-        # Step 3: Finalization
+        # Step 4: Finalization
         # This step completes the process
         await ctx.step.run(
             "finalization",
             lambda: {
                 "status": "completed",
                 "chunks_count": len(chunks),
+                "sections_count": sections_count,
                 "embeddings_count": embed_result["embeddings_count"],
                 "stored_count": embed_result["stored_count"],
                 "message": (
@@ -127,6 +143,7 @@ async def process_note(ctx: inngest.Context):
             "file_path": file_path,
             "status": "processed",
             "chunks_count": len(chunks),
+            "sections_count": sections_count,
             "embeddings_count": embed_result["embeddings_count"],
             "stored_count": embed_result["stored_count"],
             "message": (
@@ -150,15 +167,129 @@ async def process_note(ctx: inngest.Context):
         }
 
 
+def _extract_structure_step(file_path: str) -> dict:
+    """
+    Helper function for the extract-structure step.
+    Returns document structure with chapter and subsections for UI.
+    """
+    logger = logging.getLogger("obsynapse.process_note.extract_structure")
+    logger.info(f"Extracting structure from markdown file: {file_path}")
+
+    doc_structure = extract_structure(file_path)
+
+    file_path_obj = Path(file_path)
+    source_id = str(file_path_obj.resolve())
+
+    # Quick summary without deep iteration
+    if doc_structure.chapter is None:
+        logger.warning("No chapter found in document")
+        return {
+            "source_id": source_id,
+            "sections_count": 0,
+            "subsections_count": 0,
+            "total_blocks": 0,
+            "block_counts": {},
+            "subsection_summary": [],
+            "callouts": [],
+            "frontmatter": doc_structure.frontmatter
+        }
+
+    chapter = doc_structure.chapter
+    subsections_count = len(chapter.subsections)
+    logger.info(
+        f"Extracted chapter '{chapter.title}' "
+        f"with {subsections_count} subsections"
+    )
+
+    # Quick block counting (limit iteration depth)
+    block_counts = {}
+    total_blocks = len(chapter.blocks_before_subsections)
+    for block in chapter.blocks_before_subsections:
+        block_counts[block.type] = block_counts.get(block.type, 0) + 1
+
+    # Limit subsection processing for performance
+    max_subsections_to_process = 20
+    subsection_summary = []
+    callouts = []
+
+    for subsection in chapter.subsections[:max_subsections_to_process]:
+        subsection_blocks = len(subsection.blocks)
+        for subhead in subsection.subheads:
+            subsection_blocks += len(subhead.blocks)
+            for block in subhead.blocks:
+                total_blocks += 1
+                block_counts[block.type] = block_counts.get(block.type, 0) + 1
+                if block.type == "callout" and len(callouts) < 10:
+                    callouts.append({
+                        "kind": block.meta.get("kind", "unknown"),
+                        "title": block.meta.get("title", ""),
+                        "subsection": subsection.title,
+                        "subhead": subhead.title,
+                        "text_preview": (
+                            block.text[:200] + "..."
+                            if len(block.text) > 200
+                            else block.text
+                        )
+                    })
+
+        for block in subsection.blocks:
+            total_blocks += 1
+            block_counts[block.type] = block_counts.get(block.type, 0) + 1
+            if block.type == "callout" and len(callouts) < 10:
+                callouts.append({
+                    "kind": block.meta.get("kind", "unknown"),
+                    "title": block.meta.get("title", ""),
+                    "subsection": subsection.title,
+                    "text_preview": (
+                        block.text[:200] + "..."
+                        if len(block.text) > 200
+                        else block.text
+                    )
+                })
+
+        subsection_summary.append({
+            "order_index": subsection.order_index,
+            "title": subsection.title,
+            "subheads_count": len(subsection.subheads),
+            "blocks_count": subsection_blocks
+        })
+
+    # Process remaining subsections for block counts only (no summaries)
+    for subsection in chapter.subsections[max_subsections_to_process:]:
+        for subhead in subsection.subheads:
+            for block in subhead.blocks:
+                total_blocks += 1
+                block_counts[block.type] = block_counts.get(block.type, 0) + 1
+        for block in subsection.blocks:
+            total_blocks += 1
+            block_counts[block.type] = block_counts.get(block.type, 0) + 1
+
+    return {
+        "source_id": source_id,
+        "sections_count": subsections_count,  # For backwards compatibility
+        "subsections_count": subsections_count,
+        "total_blocks": total_blocks,
+        "block_counts": block_counts,
+        "subsection_summary": subsection_summary,
+        "callouts": callouts,
+        "frontmatter": doc_structure.frontmatter,
+        "chapter_title": chapter.title
+    }
+
+
 def _load_and_chunk_step(file_path: str) -> dict:
     """
     Helper function for the load-and-chunk step.
     Returns chunks and source ID for visibility in Inngest UI.
+    Uses structure-based chunking that respects heading boundaries.
     """
     logger = logging.getLogger("obsynapse.process_note.load_and_chunk")
     logger.info(f"Loading and chunking markdown file: {file_path}")
 
-    chunks = load_and_chunk_markdown(file_path)
+    # Extract structure and chunk from it
+    doc_structure = extract_structure(file_path)
+    chunks, chunk_metadata = chunk_from_structure(doc_structure)
+
     logger.info(f"Created {len(chunks)} chunks from {file_path}")
 
     file_path_obj = Path(file_path)
@@ -171,17 +302,23 @@ def _load_and_chunk_step(file_path: str) -> dict:
         for chunk in chunks[:10]  # Show first 10 chunks
     ]
 
+    # Preview metadata for first 10 chunks
+    chunk_metadata_previews = chunk_metadata[:10]
+
     return {
         "chunks": chunks,
         "chunks_count": len(chunks),
         "source_id": source_id,
         "chunk_previews": chunk_previews,
+        "chunk_metadata": chunk_metadata,  # Full metadata for embedding step
+        "chunk_metadata_previews": chunk_metadata_previews,
         "total_previewed": min(10, len(chunks))
     }
 
 
 def _embed_and_upsert_step(
     chunks: list,
+    chunk_metadata: list,
     source_id: str,
     file_path: str
 ) -> dict:
@@ -216,11 +353,22 @@ def _embed_and_upsert_step(
     payloads = []
 
     for i, chunk in enumerate(chunks):
-        # Create a deterministic UUID for each chunk
-        chunk_id = uuid.uuid5(
-            path_namespace,
-            f"chunk_{i}"
-        )
+        # Use chunk_id from metadata if available, otherwise generate
+        if (i < len(chunk_metadata) and
+                chunk_metadata[i].get("chunk_id")):
+            # Use chunk_id hash to create deterministic UUID
+            chunk_id_str = chunk_metadata[i]["chunk_id"]
+            # Create UUID5 from the chunk_id string
+            chunk_id = uuid.uuid5(
+                path_namespace,
+                f"chunk_{chunk_id_str}"
+            )
+        else:
+            # Fallback: generate deterministic UUID
+            chunk_id = uuid.uuid5(
+                path_namespace,
+                f"chunk_{i}"
+            )
         chunk_ids.append(chunk_id)
 
         # Ensure chunk text is a string and not too large
@@ -232,17 +380,40 @@ def _embed_and_upsert_step(
                 f"Truncated chunk {i} from {original_len} to 100000 chars"
             )
 
-        # Prepare payload
+        # Prepare payload with metadata if available
         try:
             relative_path_clean = relative_path.encode('utf-8').decode('utf-8')
         except (UnicodeEncodeError, UnicodeDecodeError):
             relative_path_clean = str(file_path_obj)
 
+        # Base payload
         payload = {
             "text": chunk_text,
             "source": relative_path_clean,
             "chunk_index": str(i)
         }
+
+        # Add chunk metadata if available
+        if i < len(chunk_metadata):
+            meta = chunk_metadata[i]
+            payload.update({
+                "chunk_id": meta.get("chunk_id", ""),
+                "content_hash": meta.get("content_hash", ""),
+                "chapter_title": meta.get("chapter_title", ""),
+                "subsection_index": (
+                    str(meta["subsection_index"])
+                    if meta.get("subsection_index") is not None
+                    else None
+                ),
+                "subsection_title": meta.get("subsection_title"),
+                "subhead_path": (
+                    " > ".join(meta["subhead_path"])
+                    if meta.get("subhead_path")
+                    else None
+                ),
+                "block_types": ",".join(meta.get("block_types", []))
+            })
+
         payloads.append(payload)
 
     # Upsert in batches
