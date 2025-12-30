@@ -6,11 +6,13 @@ with special handling for monospaced fonts, page numbers, and reading order.
 """
 
 import fitz  # PyMuPDF
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import re
 import argparse
 import logging
 import sys
+import os
+from datetime import datetime
 
 
 class PDFExtractor:
@@ -273,9 +275,34 @@ class PDFExtractor:
         return '\n\n'.join(markdown_parts)
 
     def close(self):
-        """Close the PDF document."""
-        if self.doc:
-            self.doc.close()
+        """
+        Close the PDF document.
+
+        Defensive cleanup that checks if document is already closed
+        using PyMuPDF's is_closed attribute and logs any errors
+        without raising exceptions.
+        """
+        if self.doc and not self.doc.is_closed:
+            try:
+                self.doc.close()
+            except Exception as e:
+                # Only log if it's not a ValueError about document being closed
+                if not (
+                    isinstance(e, ValueError) and
+                    'document closed' in str(e).lower()
+                ):
+                    # Try to log legitimate errors if logger is available
+                    try:
+                        logger = logging.getLogger(__name__)
+                        if logger.handlers:
+                            logger.error(
+                                f'Error closing PDF document: {str(e)}',
+                                exc_info=True
+                            )
+                    except Exception:
+                        # Logger not available or error logging failed
+                        # Silently continue to prevent cascade failures
+                        pass
 
     def __enter__(self):
         """Context manager entry."""
@@ -286,16 +313,88 @@ class PDFExtractor:
         self.close()
 
     def __del__(self):
-        """Cleanup on deletion."""
-        self.close()
+        """
+        Silent cleanup on deletion.
+
+        This is a fallback cleanup method. Since the with statement
+        handles primary cleanup via close(), this should be silent.
+        Only logs errors that are NOT related to the document already
+        being closed.
+        """
+        try:
+            # Check if document exists and is not already closed
+            if hasattr(self, 'doc') and self.doc and not self.doc.is_closed:
+                self.doc.close()
+            # If document is already closed, do nothing (silent)
+        except ValueError as e:
+            # Silently ignore ValueError about document being closed
+            # This is expected during garbage collection after with statement
+            if 'document closed' not in str(e).lower():
+                # Different ValueError - try to log it
+                try:
+                    logger = logging.getLogger(__name__)
+                    if logger.handlers:
+                        logger.error(
+                            f'ValueError during PDFExtractor cleanup: '
+                            f'{str(e)}',
+                            exc_info=True
+                        )
+                except Exception:
+                    pass
+        except Exception as e:
+            # Log legitimate errors (not document-closed related)
+            try:
+                logger = logging.getLogger(__name__)
+                if logger.handlers:
+                    logger.error(
+                        f'Error during PDFExtractor cleanup: {str(e)}',
+                        exc_info=True
+                    )
+            except Exception:
+                # Logger not available or error during logging
+                # Silently ignore to prevent "Exception ignored" warnings
+                pass
 
 
-def setup_logging(log_file: str) -> logging.Logger:
+def get_timestamp() -> str:
     """
-    Set up dual-logging system with console and file handlers.
+    Generate a timestamp string in YYYYMMDD_HHMMSS format.
+
+    Returns:
+        Timestamp string
+    """
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
+def setup_log_directories(base_dir: str = 'logs') -> Tuple[str, str]:
+    """
+    Create organized log directory structure.
 
     Args:
-        log_file: Path to the log file
+        base_dir: Base directory for logs (default: 'logs')
+
+    Returns:
+        Tuple of (processing_dir, errors_dir) paths
+    """
+    processing_dir = os.path.join(base_dir, 'processing')
+    errors_dir = os.path.join(base_dir, 'errors')
+
+    os.makedirs(processing_dir, exist_ok=True)
+    os.makedirs(errors_dir, exist_ok=True)
+
+    return processing_dir, errors_dir
+
+
+def setup_logging(
+    base_log_dir: str = 'logs',
+    log_filename: str = None
+) -> logging.Logger:
+    """
+    Set up triple-logging system with console and file handlers.
+
+    Args:
+        base_log_dir: Base directory for log files
+        log_filename: Optional custom log filename (without timestamp)
 
     Returns:
         Configured logger instance
@@ -315,15 +414,55 @@ def setup_logging(log_file: str) -> logging.Logger:
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
-    # File handler - DEBUG level, detailed format
-    file_handler = logging.FileHandler(log_file, mode='w')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
+    # Set up directory structure
+    processing_dir, errors_dir = setup_log_directories(base_log_dir)
+
+    # Processing log handler - DEBUG level, detailed format
+    timestamp = get_timestamp()
+    if log_filename:
+        # Use custom filename with timestamp
+        log_basename = log_filename
+        if not log_basename.endswith('.log'):
+            log_basename += '.log'
+        processing_log_file = os.path.join(
+            processing_dir, f'{timestamp}_{log_basename}'
+        )
+    else:
+        processing_log_file = os.path.join(
+            processing_dir, f'{timestamp}_extraction.log'
+        )
+
+    processing_handler = logging.FileHandler(
+        processing_log_file, mode='w'
+    )
+    processing_handler.setLevel(logging.DEBUG)
+    processing_formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - '
         '%(filename)s:%(lineno)d - %(message)s'
     )
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
+    processing_handler.setFormatter(processing_formatter)
+    logger.addHandler(processing_handler)
+
+    # Error log handler - ERROR and CRITICAL levels only, detailed format
+    # with full stack traces
+    error_log_file = os.path.join(
+        errors_dir, f'{timestamp}_errors.log'
+    )
+    error_handler = logging.FileHandler(error_log_file, mode='w')
+    error_handler.setLevel(logging.ERROR)  # Captures ERROR and CRITICAL
+    # Formatter that includes full exception tracebacks
+    # The standard Formatter automatically includes tracebacks when
+    # logger.exception() is used (which sets exc_info=True)
+    error_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - '
+        '%(filename)s:%(lineno)d - %(message)s',
+        style='%'
+    )
+    error_handler.setFormatter(error_formatter)
+    logger.addHandler(error_handler)
+
+    logger.debug(f'Processing log: {processing_log_file}')
+    logger.debug(f'Error log: {error_log_file}')
 
     return logger
 
@@ -342,23 +481,41 @@ def main():
         '--output',
         type=str,
         default=None,
-        help='Path to save extracted text (default: print to stdout)'
+        help='Path to save extracted text (default: print to stdout). '
+             'If directory does not exist, it will be created. '
+             'Timestamp will be prepended to filename if not specified.'
     )
     parser.add_argument(
         '--log-file',
         type=str,
-        default='extraction.log',
-        help='Path to the log file (default: extraction.log)'
+        default=None,
+        help='Custom log filename (without extension). '
+             'Will be timestamped and placed in logs/processing/ '
+             '(default: extraction.log)'
+    )
+    parser.add_argument(
+        '--log-dir',
+        type=str,
+        default='logs',
+        help='Base directory for log files (default: logs)'
+    )
+    parser.add_argument(
+        '--no-timestamp-output',
+        action='store_true',
+        help='Do not add timestamp to output filename'
     )
 
     args = parser.parse_args()
 
-    # Set up logging
-    logger = setup_logging(args.log_file)
+    # Generate timestamp for this run
+    timestamp = get_timestamp()
+
+    # Set up logging with organized directory structure
+    logger = setup_logging(args.log_dir, args.log_file)
 
     try:
         logger.info(f'Starting PDF extraction from: {args.pdf_path}')
-        logger.debug(f'Log file: {args.log_file}')
+        logger.debug(f'Log directory: {args.log_dir}')
         if args.output:
             logger.debug(f'Output file: {args.output}')
         else:
@@ -377,16 +534,34 @@ def main():
         # Write output to file or stdout
         try:
             if args.output:
-                with open(args.output, 'w', encoding='utf-8') as f:
+                # Determine output path with timestamp if needed
+                output_path = args.output
+                if not args.no_timestamp_output:
+                    # Add timestamp to filename
+                    dirname = os.path.dirname(output_path) or '.'
+                    basename = os.path.basename(output_path)
+                    name, ext = os.path.splitext(basename)
+                    if not ext:
+                        ext = '.md'  # Default to .md if no extension
+                    timestamped_basename = f'{timestamp}_{name}{ext}'
+                    output_path = os.path.join(dirname, timestamped_basename)
+
+                # Create output directory if it doesn't exist
+                output_dir = os.path.dirname(output_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    logger.debug(f'Created output directory: {output_dir}')
+
+                # Write file
+                with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(extracted_text)
-                logger.info(f'Extracted text saved to: {args.output}')
-                print(
-                    f'\nExtraction complete. '
-                    f'Character count: {char_count:,}\n'
-                    f'Output saved to: {args.output}'
+                logger.info(
+                    f'Extraction complete. '
+                    f'Character count: {char_count:,}'
                 )
+                logger.info(f'Output saved to: {output_path}')
             else:
-                # Print to stdout for piping
+                # Print to stdout for piping (only when --output is None)
                 sys.stdout.write(extracted_text)
                 logger.debug('Extracted text written to stdout')
         except Exception as write_error:
