@@ -48,3 +48,5 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
+*_raw_api_response.json
