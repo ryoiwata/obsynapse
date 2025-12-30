@@ -68,3 +68,7 @@ conda install conda-forge::markdown-it-py --yes
 # Used for creating structured data models (DocumentStructure, Section, Block) for the markdown IR
 conda install conda-forge::pydantic --yes
 
+
+conda install conda-forge::pyyaml --yes
+
+pip install --upgrade pymupdf
