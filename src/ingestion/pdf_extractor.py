@@ -397,6 +397,16 @@ class PDFExtractor:
         # Extract full text of the paragraph
         paragraph_text = ' '.join(block['text'] for block in paragraph).strip()
 
+        # Check for running headers/footers containing a pipe and a page number
+        # Running headers like "2 | Chapter 1" or "Title | 15" should be
+        # excluded. Check this first before other validations.
+        if '|' in paragraph_text:
+            parts = [p.strip() for p in paragraph_text.split('|')]
+            # If any part of the pipe-split text is a digit,
+            # it's a running header
+            if any(part.isdigit() for part in parts):
+                return False, 0
+
         # Exclude table and figure captions from being treated as headers
         # Check if text starts with common caption labels (case-insensitive)
         labels_to_exclude = (
@@ -410,13 +420,9 @@ class PDFExtractor:
         ):
             return False, 0
 
-        # Heuristic: If it contains parentheses or common table delimiters,
-        # it's likely a table header, not a section title
-        if (
-            '(' in paragraph_text or
-            ')' in paragraph_text or
-            '|' in paragraph_text
-        ):
+        # Heuristic: If it contains parentheses, it's likely a table header,
+        # not a section title
+        if '(' in paragraph_text or ')' in paragraph_text:
             return False, 0
 
         # Check for multiple distinct bold spans (table headers often have
@@ -537,6 +543,20 @@ class PDFExtractor:
 
         prev_paragraph = None
         for paragraph in paragraphs:
+            # Extract paragraph text for running header check
+            paragraph_text = ' '.join(
+                block['text'] for block in paragraph
+            ).strip()
+
+            # Skip running headers/footers entirely (remove from output)
+            # Check for pipe and page number pattern
+            if '|' in paragraph_text:
+                parts = [p.strip() for p in paragraph_text.split('|')]
+                # If any part of the pipe-split text is a digit,
+                # it's a running header - skip it completely
+                if any(part.isdigit() for part in parts):
+                    continue
+
             # Check if paragraph contains monospaced text
             paragraph_is_monospaced = any(
                 block['is_monospaced'] for block in paragraph
