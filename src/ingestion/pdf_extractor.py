@@ -8,6 +8,9 @@ with special handling for monospaced fonts, page numbers, and reading order.
 import fitz  # PyMuPDF
 from typing import List, Dict
 import re
+import argparse
+import logging
+import sys
 
 
 class PDFExtractor:
@@ -285,3 +288,119 @@ class PDFExtractor:
     def __del__(self):
         """Cleanup on deletion."""
         self.close()
+
+
+def setup_logging(log_file: str) -> logging.Logger:
+    """
+    Set up dual-logging system with console and file handlers.
+
+    Args:
+        log_file: Path to the log file
+
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+
+    # Console handler - INFO level, clean format
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(
+        '%(message)s'
+    )
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+
+    # File handler - DEBUG level, detailed format
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - '
+        '%(filename)s:%(lineno)d - %(message)s'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def main():
+    """Main entry point for PDF extraction CLI."""
+    parser = argparse.ArgumentParser(
+        description='Extract text from PDF files with markdown formatting'
+    )
+    parser.add_argument(
+        'pdf_path',
+        type=str,
+        help='Path to the input PDF file'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        default=None,
+        help='Path to save extracted text (default: print to stdout)'
+    )
+    parser.add_argument(
+        '--log-file',
+        type=str,
+        default='extraction.log',
+        help='Path to the log file (default: extraction.log)'
+    )
+
+    args = parser.parse_args()
+
+    # Set up logging
+    logger = setup_logging(args.log_file)
+
+    try:
+        logger.info(f'Starting PDF extraction from: {args.pdf_path}')
+        logger.debug(f'Log file: {args.log_file}')
+        if args.output:
+            logger.debug(f'Output file: {args.output}')
+        else:
+            logger.debug('Output: stdout (piping mode)')
+
+        # Extract text from PDF
+        with PDFExtractor(args.pdf_path) as extractor:
+            extracted_text = extractor.extract()
+
+        logger.info('PDF extraction completed successfully')
+
+        # Verification: get character count
+        char_count = len(extracted_text)
+        logger.info(f'Extracted text character count: {char_count:,}')
+
+        # Write output to file or stdout
+        try:
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(extracted_text)
+                logger.info(f'Extracted text saved to: {args.output}')
+                print(
+                    f'\nExtraction complete. '
+                    f'Character count: {char_count:,}\n'
+                    f'Output saved to: {args.output}'
+                )
+            else:
+                # Print to stdout for piping
+                sys.stdout.write(extracted_text)
+                logger.debug('Extracted text written to stdout')
+        except Exception as write_error:
+            logger.exception(
+                f'Error writing output file: {str(write_error)}'
+            )
+            sys.exit(1)
+
+    except Exception as e:
+        logger.exception(
+            f'Error during PDF extraction: {str(e)}'
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
