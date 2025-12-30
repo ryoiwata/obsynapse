@@ -27,7 +27,6 @@ import inngest.fast_api
 from src.ingestion import (  # noqa: E402
     embed_texts,
     extract_structure,
-    chunk_from_structure,
     EMBED_DIM
 )
 from src.db import QdrantStorage  # noqa: E402
@@ -58,9 +57,8 @@ async def process_note(ctx: inngest.Context):
     """
     Process a note that was updated in the vault.
 
-    Loads the markdown file, chunks it, generates embeddings, and stores
-    them in the vector database. This is the first step in the ingestion
-    pipeline.
+    Loads the markdown file, extracts structure, and stores it.
+    This is the first step in the ingestion pipeline.
     """
     event_data = ctx.event.data
     file_path = event_data.get("file_path")
@@ -77,69 +75,23 @@ async def process_note(ctx: inngest.Context):
         }
 
     try:
-        # Step 1: Extract structure and chunk in one step to avoid
-        # double extraction. This combines structure extraction and
-        # chunking for better performance.
-        load_result = await ctx.step.run(
-            "extract-and-chunk",
-            lambda: _extract_and_chunk_step(file_path)
+        # Step 1: Extract structure from markdown file
+        structure_result = await ctx.step.run(
+            "extract-structure",
+            lambda: _extract_structure_step(file_path)
         )
 
-        chunks = load_result["chunks"]
-        chunk_metadata = load_result.get("chunk_metadata", [])
-        source_id = load_result["source_id"]
-        sections_count = load_result.get("sections_count", 0)
+        source_id = structure_result["source_id"]
+        sections_count = structure_result.get("sections_count", 0)
 
-        if not chunks:
-            logger.warning(f"No chunks extracted from {file_path}")
-            return {
-                "file_path": file_path,
-                "status": "processed",
-                "chunks_count": 0,
-                "sections_count": sections_count,
-                "message": "No content to process"
-            }
-
-        # Step 2: Generate embeddings and store in vector database
-        # This step will be visible in the Inngest UI
-        embed_result = await ctx.step.run(
-            "embed-and-upsert",
-            lambda: _embed_and_upsert_step(
-                chunks=chunks,
-                chunk_metadata=chunk_metadata,
-                source_id=source_id,
-                file_path=file_path
-            )
-        )
-
-        # Step 3: Finalization
-        # This step completes the process
-        await ctx.step.run(
-            "finalization",
-            lambda: {
-                "status": "completed",
-                "chunks_count": len(chunks),
-                "sections_count": sections_count,
-                "embeddings_count": embed_result["embeddings_count"],
-                "stored_count": embed_result["stored_count"],
-                "message": (
-                    "Successfully processed and stored in vector database"
-                )
-            }
-        )
-
-        logger.info("Note processing complete, ready for concept extraction")
+        logger.info("Note structure extraction complete")
 
         return {
             "file_path": file_path,
             "status": "processed",
-            "chunks_count": len(chunks),
             "sections_count": sections_count,
-            "embeddings_count": embed_result["embeddings_count"],
-            "stored_count": embed_result["stored_count"],
-            "message": (
-                "Successfully processed and stored in vector database"
-            )
+            "source_id": source_id,
+            "message": "Successfully extracted document structure"
         }
 
     except FileNotFoundError as e:
@@ -156,90 +108,6 @@ async def process_note(ctx: inngest.Context):
             "status": "error",
             "error": str(e)
         }
-
-
-def _extract_and_chunk_step(file_path: str) -> dict:
-    """
-    Combined step that extracts structure and chunks in one pass.
-    This avoids double extraction and improves performance.
-    """
-    logger = logging.getLogger("obsynapse.process_note.extract_and_chunk")
-    logger.info(f"Extracting structure and chunking: {file_path}")
-
-    # Extract structure once
-    doc_structure = extract_structure(file_path)
-
-    file_path_obj = Path(file_path)
-    source_id = str(file_path_obj.resolve())
-
-    # Get section count for reporting
-    sections_count = 0
-    if doc_structure.chapter:
-        sections_count = len(doc_structure.chapter.subsections)
-
-    # Chunk from structure
-    chunks, chunk_metadata = chunk_from_structure(doc_structure)
-
-    logger.info(f"Created {len(chunks)} chunks from {file_path}")
-
-    # Return lightweight metadata - don't serialize full embed_text/study_text
-    # They're already in chunks list
-    lightweight_metadata = []
-    for meta in chunk_metadata:
-        lightweight = {
-            "chunk_index": meta.get("chunk_index"),
-            "chunk_id": meta.get("chunk_id"),
-            "content_hash": meta.get("content_hash"),
-            "scope_hash": meta.get("scope_hash"),
-            "note_path": meta.get("note_path"),
-            "chapter_title": meta.get("chapter_title"),
-            "subsection_index": meta.get("subsection_index"),
-            "subsection_title": meta.get("subsection_title"),
-            "subhead_path": meta.get("subhead_path"),
-            "chunk_scope": meta.get("chunk_scope"),
-            "scope_key": meta.get("scope_key"),
-            "block_refs": meta.get("block_refs"),
-            "block_types": meta.get("block_types"),
-            "chunking_decisions": meta.get("chunking_decisions"),
-            "has_optional_blocks": meta.get("has_optional_blocks"),
-            "chunk_role": meta.get("chunk_role"),
-            "breadcrumb": meta.get("breadcrumb"),
-            "hierarchy": meta.get("hierarchy"),
-            "list_item_count": meta.get("list_item_count"),
-            "list_group_index": meta.get("list_group_index")
-            # Exclude embed_text and study_text - they're in chunks
-        }
-        lightweight_metadata.append(lightweight)
-
-    # Quick summary for UI (limit processing for performance)
-    chunk_previews = [
-        (chunk[:500] + "..." if len(chunk) > 500 else chunk)
-        for chunk in chunks[:10]  # Show first 10 chunks
-    ]
-
-    chunk_metadata_previews = []
-    for meta in chunk_metadata[:10]:
-        preview = {
-            "chunk_index": meta.get("chunk_index"),
-            "chunk_id": meta.get("chunk_id", "")[:16],  # Truncate
-            "chunk_role": meta.get("chunk_role"),
-            "chunk_scope": meta.get("chunk_scope"),
-            "breadcrumb": meta.get("breadcrumb"),
-            "block_types": meta.get("block_types", []),
-            "content_length": len(meta.get("embed_text", ""))
-        }
-        chunk_metadata_previews.append(preview)
-
-    return {
-        "chunks": chunks,
-        "chunks_count": len(chunks),
-        "source_id": source_id,
-        "sections_count": sections_count,
-        "chunk_metadata": lightweight_metadata,
-        "chunk_previews": chunk_previews,
-        "chunk_metadata_previews": chunk_metadata_previews,
-        "total_previewed": min(10, len(chunks))
-    }
 
 
 def _extract_structure_step(file_path: str) -> dict:
