@@ -95,18 +95,69 @@ class PDFExtractor:
 
     def _sort_blocks_by_position(self, blocks: List[Dict]) -> List[Dict]:
         """
-        Sort text blocks by Y-coordinate (top to bottom).
+        Sort text blocks using line-based sorting.
 
-        For blocks on the same line, sort by X-coordinate (left to right).
+        Groups blocks into visual lines based on Y-coordinate tolerance,
+        then sorts blocks within each line by X-coordinate. This prevents
+        floating text or margin notes with slightly different Y-values from
+        appearing out of order.
 
         Args:
             blocks: List of text block dictionaries
 
         Returns:
-            Sorted list of blocks
+            Sorted list of blocks with line-based ordering
         """
-        # Sort by Y, then X
-        return sorted(blocks, key=lambda b: (b['y_pos'], b['bbox'][0]))
+        if not blocks:
+            return []
+
+        # Tolerance for grouping blocks into the same line (in pixels)
+        LINE_TOLERANCE = 3.0
+
+        # First, sort all blocks by Y-coordinate to process top-to-bottom
+        blocks_sorted_by_y = sorted(blocks, key=lambda b: b['y_pos'])
+
+        # Group blocks into lines based on Y-coordinate tolerance
+        lines = []
+        current_line = []
+        current_line_y = None
+
+        for block in blocks_sorted_by_y:
+            block_y = block['y_pos']
+
+            # If this is the first block or Y is within tolerance,
+            # add to current line
+            if (current_line_y is None or
+                    abs(block_y - current_line_y) <= LINE_TOLERANCE):
+                current_line.append(block)
+                # Update current_line_y to the average Y of blocks in this line
+                # This helps handle lines with slight variations
+                if current_line_y is None:
+                    current_line_y = block_y
+                else:
+                    # Use the minimum Y to keep line position accurate
+                    current_line_y = min(current_line_y, block_y)
+            else:
+                # Y difference exceeds tolerance, start a new line
+                if current_line:
+                    # Sort current line by X-coordinate (left to right)
+                    current_line.sort(key=lambda b: b['bbox'][0])
+                    lines.append(current_line)
+                current_line = [block]
+                current_line_y = block_y
+
+        # Don't forget the last line
+        if current_line:
+            current_line.sort(key=lambda b: b['bbox'][0])
+            lines.append(current_line)
+
+        # Flatten lines back into a single list
+        # Blocks are already sorted within each line, and lines are in order
+        sorted_blocks = []
+        for line in lines:
+            sorted_blocks.extend(line)
+
+        return sorted_blocks
 
     def _group_blocks_into_paragraphs(
         self, blocks: List[Dict]
