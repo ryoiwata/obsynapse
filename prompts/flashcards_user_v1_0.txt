@@ -1,0 +1,5 @@
+Create flashcards from this parsed Obsidian note JSON (it is a JSON string). Use ONLY this content.
+
+PARSED_NOTE_JSON:
+```json
+"{parsed_json}"

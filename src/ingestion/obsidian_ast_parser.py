@@ -34,7 +34,6 @@ from pathlib import Path
 Chunk = Union[
     Dict[str, Any],  # { "path": List[str], "text": str }
     Dict[str, Any],  # { "path": List[str], "bullets": List[str] }
-    Dict[str, Any],  # { "path": List[str], "embeds": List[Dict[str, str]] }
 ]
 
 NoteAstLite = Dict[str, Any]  # { "note_id": str, "title": str, "frontmatter": Dict, "chunks": List[Chunk] }
@@ -46,7 +45,6 @@ FRONTMATTER_END = re.compile(r'^---\s*$')
 HEADING_RE = re.compile(r'^(#{1,6})\s+(.+)$')
 BULLET_RE = re.compile(r'^(\s*)([-*+])\s+(.+)$')
 ORDERED_LIST_RE = re.compile(r'^(\s*)(\d+\.)\s+(.+)$')
-EMBED_RE = re.compile(r'!\[\[([^\]]+)\]\]')
 CODE_FENCE_START = re.compile(r'^```')
 BLOCKQUOTE_RE = re.compile(r'^(\s*)>\s*(.*)$')
 HORIZONTAL_RULE = re.compile(r'^---+$')
@@ -163,14 +161,6 @@ def is_code_fence(line: str, in_code: bool) -> bool:
     return bool(CODE_FENCE_START.match(line))
 
 
-def extract_embeds_from_line(line: str) -> List[str]:
-    """Extract embed references from a line."""
-    embeds = []
-    for match in EMBED_RE.finditer(line):
-        embeds.append(match.group(1))
-    return embeds
-
-
 def is_blockquote(line: str) -> bool:
     """Check if line is a blockquote."""
     return bool(BLOCKQUOTE_RE.match(line))
@@ -208,9 +198,7 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
     # Current block state
     current_paragraph_lines: List[str] = []
     current_bullets: List[str] = []
-    current_embeds: List[Dict[str, str]] = []
     in_code_block = False
-    code_fence_indent = 0
     
     # Track title and note_id
     title: Optional[str] = None
@@ -240,31 +228,17 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
             })
             current_bullets = []
     
-    def flush_embeds():
-        """Flush current embed block if non-empty."""
-        nonlocal current_embeds
-        if current_embeds:
-            chunks.append({
-                "path": heading_path.copy(),
-                "embeds": current_embeds.copy()
-            })
-            current_embeds = []
-    
     i = 0
     while i < len(lines):
         line = lines[i]
-        original_line = line
         
         # Check for code fence
         if CODE_FENCE_START.match(line):
             # Flush any pending blocks before entering code
             flush_paragraph()
             flush_bullets()
-            flush_embeds()
             
             in_code_block = not in_code_block
-            if in_code_block:
-                code_fence_indent = len(line) - len(line.lstrip())
             i += 1
             continue
         
@@ -281,7 +255,6 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
             # Flush any pending blocks before new heading
             flush_paragraph()
             flush_bullets()
-            flush_embeds()
             
             # Update heading path
             # Remove headings at same or deeper level
@@ -305,7 +278,6 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
         if HORIZONTAL_RULE.match(line.strip()):
             flush_paragraph()
             flush_bullets()
-            flush_embeds()
             i += 1
             continue
         
@@ -313,19 +285,21 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
         blockquote_match = BLOCKQUOTE_RE.match(line)
         if blockquote_match:
             quote_text = blockquote_match.group(2)
-            # Flush bullets/embeds if switching to paragraph
+            # Flush bullets if switching to paragraph
             flush_bullets()
-            flush_embeds()
-            current_paragraph_lines.append(quote_text)
+            # Remove embed syntax from blockquote if present
+            quote_text = re.sub(r'!\[\[([^\]]+)\]\]', '', quote_text).strip()
+            if quote_text:
+                current_paragraph_lines.append(quote_text)
             i += 1
             continue
         
         # Check for bullet/ordered list
         bullet_match = BULLET_RE.match(line) or ORDERED_LIST_RE.match(line)
         if bullet_match:
-            # Flush paragraph/embeds if switching to bullets
+            # Flush paragraph BEFORE starting bullet block to preserve label + bullet pattern
+            # This ensures the label becomes its own text chunk, and bullets become a separate chunk
             flush_paragraph()
-            flush_embeds()
             
             # Extract bullet text (remove marker)
             if BULLET_RE.match(line):
@@ -337,37 +311,15 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
             i += 1
             continue
         
-        # Check for embeds
-        embeds_in_line = extract_embeds_from_line(line)
-        if embeds_in_line:
-            # Flush paragraph/bullets if switching to embeds
-            flush_paragraph()
-            flush_bullets()
-            
-            for embed_ref in embeds_in_line:
-                current_embeds.append({
-                    "type": "embed_image",
-                    "ref": embed_ref
-                })
-            
-            # Remove embed syntax from line for text processing
-            line_without_embeds = EMBED_RE.sub('', line).strip()
-            if line_without_embeds:
-                # If there's remaining text, treat as paragraph
-                current_paragraph_lines.append(line_without_embeds)
-            i += 1
-            continue
-        
         # Empty line
         if not line.strip():
             # Flush bullets (paragraphs can span blank lines)
             flush_bullets()
-            flush_embeds()
             
             # For paragraphs, a single blank line is OK (merge)
             # Multiple blank lines flush the paragraph
             if current_paragraph_lines:
-                # Check if next non-empty line is also a paragraph
+                # Check if next non-empty line is also a paragraph continuation
                 next_non_empty = None
                 for j in range(i + 1, len(lines)):
                     next_line = lines[j]
@@ -382,33 +334,44 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
                 if next_non_empty:
                     next_heading = get_heading_level(next_non_empty)
                     next_bullet = is_bullet_line(next_non_empty)
-                    next_embed = extract_embeds_from_line(next_non_empty)
                     next_blockquote = is_blockquote(next_non_empty)
                     
-                    if next_heading or next_bullet or next_embed or next_blockquote:
+                    # CRITICAL: Preserve label + bullet pattern
+                    # If next line is a bullet, DON'T flush paragraph here
+                    # Let the bullet handler flush it, which preserves the label as its own chunk
+                    if next_heading or next_blockquote:
                         flush_paragraph()
+                    elif next_bullet:
+                        # DON'T flush - bullet handler will flush it, preserving label + bullet
+                        pass
                     else:
-                        # Check if there's another blank line after this one
+                        # Next is regular paragraph text - check for double blank
                         has_double_blank = False
                         if i + 1 < len(lines) and not lines[i + 1].strip():
                             has_double_blank = True
                         
                         if has_double_blank:
                             flush_paragraph()
+                else:
+                    # No next non-empty line found - keep paragraph
+                    pass
             
             i += 1
             continue
         
         # Regular paragraph line
+        # Note: This branch only runs if line is NOT heading, NOT code, NOT empty,
+        # NOT bullet, and NOT blockquote
         flush_bullets()
-        flush_embeds()
-        current_paragraph_lines.append(line)
+        # Remove embed syntax from line if present (embeds are ignored)
+        line_without_embeds = re.sub(r'!\[\[([^\]]+)\]\]', '', line).strip()
+        if line_without_embeds:
+            current_paragraph_lines.append(line_without_embeds)
         i += 1
     
     # Flush any remaining blocks
     flush_paragraph()
     flush_bullets()
-    flush_embeds()
     
     # Merge adjacent chunks of same type under same path
     merged_chunks = []
@@ -438,7 +401,7 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
                 j += 1
                 continue
             
-            # Don't merge embeds or different types
+            # Don't merge different types
             break
         
         merged_chunks.append(merged_chunk)
@@ -450,8 +413,6 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
         if "text" in chunk and chunk["text"].strip():
             filtered_chunks.append(chunk)
         elif "bullets" in chunk and chunk["bullets"]:
-            filtered_chunks.append(chunk)
-        elif "embeds" in chunk and chunk["embeds"]:
             filtered_chunks.append(chunk)
     
     # Determine title and note_id
@@ -472,4 +433,76 @@ def parseObsidianToAstLite(markdown: str, fileName: Optional[str] = None) -> Not
         "frontmatter": frontmatter,
         "chunks": filtered_chunks
     }
+
+
+if __name__ == "__main__":
+    """
+    Command-line interface for testing the parser.
+    
+    Usage:
+        python obsidian_ast_parser.py <file_path>
+        python obsidian_ast_parser.py <file_path> --pretty
+    """
+    import sys
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Parse Obsidian markdown file to AST-lite JSON"
+    )
+    parser.add_argument(
+        "file_path",
+        type=str,
+        help="Path to the markdown file to parse"
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Pretty print JSON output with indentation"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Output file path (default: print to stdout)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Read file
+    file_path = Path(args.file_path)
+    if not file_path.exists():
+        print(f"Error: File not found: {file_path}", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            markdown_content = f.read()
+    except Exception as e:
+        print(f"Error reading file: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse
+    try:
+        result = parseObsidianToAstLite(markdown_content, str(file_path))
+    except Exception as e:
+        print(f"Error parsing markdown: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Output
+    if args.pretty:
+        output_json = json.dumps(result, indent=2, ensure_ascii=False)
+    else:
+        output_json = json.dumps(result, ensure_ascii=False)
+    
+    if args.output:
+        try:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output_json)
+            print(f"Output written to: {args.output}")
+        except Exception as e:
+            print(f"Error writing output file: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(output_json)
 
