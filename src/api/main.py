@@ -77,27 +77,18 @@ async def process_note(ctx: inngest.Context):
         }
 
     try:
-        # Step 1: Extract document structure (sections, blocks, frontmatter)
-        # This step parses the markdown into a structured IR
-        structure_result = await ctx.step.run(
-            "extract-structure",
-            lambda: _extract_structure_step(file_path)
-        )
-
-        source_id = structure_result["source_id"]
-        sections_count = structure_result["sections_count"]
-        # Note: We don't need the full structure for embedding,
-        # just the source_id and metadata
-
-        # Step 2: Load and chunk the markdown file
-        # This step will be visible in the Inngest UI with chunk details
+        # Step 1: Extract structure and chunk in one step to avoid
+        # double extraction. This combines structure extraction and
+        # chunking for better performance.
         load_result = await ctx.step.run(
-            "load-and-chunk",
-            lambda: _load_and_chunk_step(file_path)
+            "extract-and-chunk",
+            lambda: _extract_and_chunk_step(file_path)
         )
 
         chunks = load_result["chunks"]
         chunk_metadata = load_result.get("chunk_metadata", [])
+        source_id = load_result["source_id"]
+        sections_count = load_result.get("sections_count", 0)
 
         if not chunks:
             logger.warning(f"No chunks extracted from {file_path}")
@@ -109,7 +100,7 @@ async def process_note(ctx: inngest.Context):
                 "message": "No content to process"
             }
 
-        # Step 3: Generate embeddings and store in vector database
+        # Step 2: Generate embeddings and store in vector database
         # This step will be visible in the Inngest UI
         embed_result = await ctx.step.run(
             "embed-and-upsert",
@@ -121,7 +112,7 @@ async def process_note(ctx: inngest.Context):
             )
         )
 
-        # Step 4: Finalization
+        # Step 3: Finalization
         # This step completes the process
         await ctx.step.run(
             "finalization",
@@ -167,6 +158,90 @@ async def process_note(ctx: inngest.Context):
         }
 
 
+def _extract_and_chunk_step(file_path: str) -> dict:
+    """
+    Combined step that extracts structure and chunks in one pass.
+    This avoids double extraction and improves performance.
+    """
+    logger = logging.getLogger("obsynapse.process_note.extract_and_chunk")
+    logger.info(f"Extracting structure and chunking: {file_path}")
+
+    # Extract structure once
+    doc_structure = extract_structure(file_path)
+
+    file_path_obj = Path(file_path)
+    source_id = str(file_path_obj.resolve())
+
+    # Get section count for reporting
+    sections_count = 0
+    if doc_structure.chapter:
+        sections_count = len(doc_structure.chapter.subsections)
+
+    # Chunk from structure
+    chunks, chunk_metadata = chunk_from_structure(doc_structure)
+
+    logger.info(f"Created {len(chunks)} chunks from {file_path}")
+
+    # Return lightweight metadata - don't serialize full embed_text/study_text
+    # They're already in chunks list
+    lightweight_metadata = []
+    for meta in chunk_metadata:
+        lightweight = {
+            "chunk_index": meta.get("chunk_index"),
+            "chunk_id": meta.get("chunk_id"),
+            "content_hash": meta.get("content_hash"),
+            "scope_hash": meta.get("scope_hash"),
+            "note_path": meta.get("note_path"),
+            "chapter_title": meta.get("chapter_title"),
+            "subsection_index": meta.get("subsection_index"),
+            "subsection_title": meta.get("subsection_title"),
+            "subhead_path": meta.get("subhead_path"),
+            "chunk_scope": meta.get("chunk_scope"),
+            "scope_key": meta.get("scope_key"),
+            "block_refs": meta.get("block_refs"),
+            "block_types": meta.get("block_types"),
+            "chunking_decisions": meta.get("chunking_decisions"),
+            "has_optional_blocks": meta.get("has_optional_blocks"),
+            "chunk_role": meta.get("chunk_role"),
+            "breadcrumb": meta.get("breadcrumb"),
+            "hierarchy": meta.get("hierarchy"),
+            "list_item_count": meta.get("list_item_count"),
+            "list_group_index": meta.get("list_group_index")
+            # Exclude embed_text and study_text - they're in chunks
+        }
+        lightweight_metadata.append(lightweight)
+
+    # Quick summary for UI (limit processing for performance)
+    chunk_previews = [
+        (chunk[:500] + "..." if len(chunk) > 500 else chunk)
+        for chunk in chunks[:10]  # Show first 10 chunks
+    ]
+
+    chunk_metadata_previews = []
+    for meta in chunk_metadata[:10]:
+        preview = {
+            "chunk_index": meta.get("chunk_index"),
+            "chunk_id": meta.get("chunk_id", "")[:16],  # Truncate
+            "chunk_role": meta.get("chunk_role"),
+            "chunk_scope": meta.get("chunk_scope"),
+            "breadcrumb": meta.get("breadcrumb"),
+            "block_types": meta.get("block_types", []),
+            "content_length": len(meta.get("embed_text", ""))
+        }
+        chunk_metadata_previews.append(preview)
+
+    return {
+        "chunks": chunks,
+        "chunks_count": len(chunks),
+        "source_id": source_id,
+        "sections_count": sections_count,
+        "chunk_metadata": lightweight_metadata,
+        "chunk_previews": chunk_previews,
+        "chunk_metadata_previews": chunk_metadata_previews,
+        "total_previewed": min(10, len(chunks))
+    }
+
+
 def _extract_structure_step(file_path: str) -> dict:
     """
     Helper function for the extract-structure step.
@@ -191,7 +266,8 @@ def _extract_structure_step(file_path: str) -> dict:
             "block_counts": {},
             "subsection_summary": [],
             "callouts": [],
-            "frontmatter": doc_structure.frontmatter
+            "frontmatter": doc_structure.frontmatter,
+            "doc_structure_data": None  # No structure to pass
         }
 
     chapter = doc_structure.chapter
@@ -264,6 +340,8 @@ def _extract_structure_step(file_path: str) -> dict:
             total_blocks += 1
             block_counts[block.type] = block_counts.get(block.type, 0) + 1
 
+    # Return structure for reuse (don't serialize full blocks to save space)
+    # Pass file_path to avoid re-serialization
     return {
         "source_id": source_id,
         "sections_count": subsections_count,  # For backwards compatibility
@@ -273,46 +351,9 @@ def _extract_structure_step(file_path: str) -> dict:
         "subsection_summary": subsection_summary,
         "callouts": callouts,
         "frontmatter": doc_structure.frontmatter,
-        "chapter_title": chapter.title
-    }
-
-
-def _load_and_chunk_step(file_path: str) -> dict:
-    """
-    Helper function for the load-and-chunk step.
-    Returns chunks and source ID for visibility in Inngest UI.
-    Uses structure-based chunking that respects heading boundaries.
-    """
-    logger = logging.getLogger("obsynapse.process_note.load_and_chunk")
-    logger.info(f"Loading and chunking markdown file: {file_path}")
-
-    # Extract structure and chunk from it
-    doc_structure = extract_structure(file_path)
-    chunks, chunk_metadata = chunk_from_structure(doc_structure)
-
-    logger.info(f"Created {len(chunks)} chunks from {file_path}")
-
-    file_path_obj = Path(file_path)
-    source_id = str(file_path_obj.resolve())
-
-    # Return result with chunks visible in UI
-    # Limit chunk preview to first 500 chars for UI display
-    chunk_previews = [
-        (chunk[:500] + "..." if len(chunk) > 500 else chunk)
-        for chunk in chunks[:10]  # Show first 10 chunks
-    ]
-
-    # Preview metadata for first 10 chunks
-    chunk_metadata_previews = chunk_metadata[:10]
-
-    return {
-        "chunks": chunks,
-        "chunks_count": len(chunks),
-        "source_id": source_id,
-        "chunk_previews": chunk_previews,
-        "chunk_metadata": chunk_metadata,  # Full metadata for embedding step
-        "chunk_metadata_previews": chunk_metadata_previews,
-        "total_previewed": min(10, len(chunks))
+        "chapter_title": chapter.title,
+        # Pass file_path to avoid re-serialization
+        "doc_structure_data": file_path
     }
 
 
