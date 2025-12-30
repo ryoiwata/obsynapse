@@ -59,3 +59,12 @@ conda install conda-forge::streamlit --yes
 # uv: Fast Python package installer and resolver (written in Rust)
 # High-performance alternative to pip for faster package installation and dependency resolution
 conda install conda-forge::uv --yes
+
+# markdown-it-py: Markdown parser that converts markdown to AST tokens
+# Used by the structure extraction module to parse Obsidian markdown into sections, blocks, and callouts
+conda install conda-forge::markdown-it-py --yes
+
+# pydantic: Data validation library using Python type annotations
+# Used for creating structured data models (DocumentStructure, Section, Block) for the markdown IR
+conda install conda-forge::pydantic --yes
+
