@@ -79,6 +79,14 @@ class PDFExtractor:
                     bbox = span.get('bbox', [0, 0, 0, 0])
                     y_pos = bbox[1]  # Top Y coordinate
 
+                    # Check if text is bold
+                    # PyMuPDF flags: bit 4 (16) indicates bold
+                    flags = span.get('flags', 0)
+                    is_bold = (
+                        (flags & 16) != 0 or
+                        'bold' in span.get('font', '').lower()
+                    )
+
                     # Store span info
                     blocks.append({
                         'text': text,
@@ -88,7 +96,8 @@ class PDFExtractor:
                         'bbox': bbox,
                         'is_monospaced': self._is_monospaced_font(
                             span.get('font', '')
-                        )
+                        ),
+                        'is_bold': is_bold
                     })
 
         return blocks
@@ -330,28 +339,177 @@ class PDFExtractor:
 
         return merged
 
+    def _calculate_baseline_font_size(
+        self, all_blocks: List[Dict]
+    ) -> float:
+        """
+        Calculate the baseline (most common) font size in the document.
+
+        This is used to differentiate headers from body text.
+
+        Args:
+            all_blocks: List of all text blocks from the document
+
+        Returns:
+            Baseline font size (most frequent font size)
+        """
+        if not all_blocks:
+            return 12.0  # Default fallback
+
+        # Count font sizes, rounding to nearest 0.5 for grouping
+        font_size_counts = {}
+        for block in all_blocks:
+            size = block.get('font_size', 0)
+            if size > 0:
+                # Round to nearest 0.5 for grouping similar sizes
+                rounded_size = round(size * 2) / 2
+                font_size_counts[rounded_size] = (
+                    font_size_counts.get(rounded_size, 0) + 1
+                )
+
+        if not font_size_counts:
+            return 12.0  # Default fallback
+
+        # Return the most common font size
+        baseline = max(font_size_counts.items(), key=lambda x: x[1])[0]
+        return baseline
+
+    def _is_header_paragraph(
+        self, paragraph: List[Dict], baseline_font_size: float,
+        prev_paragraph: List[Dict] = None
+    ) -> Tuple[bool, int]:
+        """
+        Determine if a paragraph is a header and what level it should be.
+
+        Args:
+            paragraph: List of blocks in the paragraph
+            baseline_font_size: Baseline font size for body text
+            prev_paragraph: Previous paragraph (for spacing check)
+
+        Returns:
+            Tuple of (is_header, header_level)
+            - is_header: True if paragraph is a header
+            - header_level: 1, 2, or 3 for #, ##, ### respectively
+        """
+        if not paragraph:
+            return False, 0
+
+        # Headers are typically short (single line or very few words)
+        paragraph_text = ' '.join(block['text'] for block in paragraph).strip()
+        word_count = len(paragraph_text.split())
+
+        # Headers are usually 1-15 words
+        if word_count > 15:
+            return False, 0
+
+        # Check if paragraph has significant vertical spacing before it
+        # (indicating it's a section break, not inline text)
+        has_spacing = False
+        if prev_paragraph and paragraph:
+            prev_y = prev_paragraph[-1].get('y_pos', 0)
+            current_y = paragraph[0].get('y_pos', 0)
+            y_diff = current_y - prev_y
+
+            # Check if there's significant vertical spacing
+            # (more than 1.5x the average font size)
+            avg_font_size = (
+                paragraph[0].get('font_size', baseline_font_size) +
+                prev_paragraph[-1].get('font_size', baseline_font_size)
+            ) / 2
+            spacing_threshold = avg_font_size * 1.5
+
+            if y_diff > spacing_threshold:
+                has_spacing = True
+
+        # Get font properties of the paragraph
+        # Use the maximum font size in the paragraph (headers are consistent)
+        max_font_size = max(
+            (block.get('font_size', 0) for block in paragraph),
+            default=0
+        )
+        is_bold = any(block.get('is_bold', False) for block in paragraph)
+
+        # Calculate size ratio relative to baseline
+        if baseline_font_size > 0:
+            size_ratio = max_font_size / baseline_font_size
+        else:
+            size_ratio = 1.0
+
+        # Header detection criteria:
+        # 1. Significantly larger font size OR bold text
+        # 2. Short paragraph (already checked above)
+        # 3. Has spacing before it (if previous paragraph exists)
+        is_header = False
+        header_level = 0
+
+        # Very large font (1.5x+ baseline) or bold + large -> Header 1
+        if (size_ratio >= 1.5 or (is_bold and size_ratio >= 1.3)):
+            is_header = True
+            header_level = 1
+        # Medium-large font (1.3x+ baseline) or bold -> Header 2
+        elif (size_ratio >= 1.3 or (is_bold and size_ratio >= 1.15)):
+            is_header = True
+            header_level = 2
+        # Slightly larger than baseline or bold -> Header 3
+        elif (size_ratio >= 1.15 or is_bold):
+            is_header = True
+            header_level = 3
+
+        # Additional check: if no spacing and not significantly larger,
+        # it might be a bold list item or inline text, not a header
+        if prev_paragraph and not has_spacing and size_ratio < 1.3:
+            # Be more conservative - require both bold AND larger size
+            if not (is_bold and size_ratio >= 1.2):
+                is_header = False
+                header_level = 0
+
+        return is_header, header_level
+
     def _paragraphs_to_markdown(
-        self, paragraphs: List[List[Dict]]
+        self, paragraphs: List[List[Dict]], all_blocks: List[Dict] = None
     ) -> List[str]:
         """
-        Convert paragraphs to markdown format with code block handling.
+        Convert paragraphs to markdown format with code block and
+        header handling.
 
         Args:
             paragraphs: List of paragraphs, where each paragraph is a
                         list of blocks
+            all_blocks: All blocks from the document (for baseline calculation)
 
         Returns:
             List of markdown strings
         """
+        # Calculate baseline font size for header detection
+        if all_blocks:
+            baseline_font_size = self._calculate_baseline_font_size(all_blocks)
+        else:
+            # Fallback: collect all blocks from paragraphs
+            all_blocks_flat = []
+            for para in paragraphs:
+                all_blocks_flat.extend(para)
+            baseline_font_size = self._calculate_baseline_font_size(
+                all_blocks_flat
+            )
+
         markdown_parts = []
         current_code_block = []
         in_code_block = False
 
+        prev_paragraph = None
         for paragraph in paragraphs:
             # Check if paragraph contains monospaced text
             paragraph_is_monospaced = any(
                 block['is_monospaced'] for block in paragraph
             )
+
+            # Check if paragraph is a header (but not if it's monospaced)
+            is_header = False
+            header_level = 0
+            if not paragraph_is_monospaced:
+                is_header, header_level = self._is_header_paragraph(
+                    paragraph, baseline_font_size, prev_paragraph
+                )
 
             if paragraph_is_monospaced:
                 # Start or continue code block
@@ -373,12 +531,24 @@ class PDFExtractor:
                     current_code_block = []
                     in_code_block = False
 
-                # Add regular paragraph
+                # Get paragraph text
                 paragraph_text = ' '.join(
                     block['text'] for block in paragraph
-                )
-                if paragraph_text.strip():
-                    markdown_parts.append(paragraph_text)
+                ).strip()
+
+                if paragraph_text:
+                    if is_header:
+                        # Format as Markdown header
+                        header_prefix = '#' * header_level
+                        markdown_parts.append(
+                            f'{header_prefix} {paragraph_text}'
+                        )
+                    else:
+                        # Add regular paragraph
+                        markdown_parts.append(paragraph_text)
+
+            # Update previous paragraph for spacing checks
+            prev_paragraph = paragraph
 
         # Close any remaining code block
         if in_code_block:
@@ -408,6 +578,8 @@ class PDFExtractor:
             paragraphs
         """
         page_paragraphs = []
+        # Collect all blocks for baseline font size calculation
+        all_blocks = []
 
         # Process each page individually to preserve reading order
         # This ensures Page 1 content is fully processed before Page 2
@@ -416,6 +588,7 @@ class PDFExtractor:
 
             # Extract blocks from this page
             blocks = self._extract_text_blocks(page)
+            all_blocks.extend(blocks)  # Collect for baseline calculation
 
             # Sort blocks by position (within this page only)
             # This ensures correct reading order within each page
@@ -433,7 +606,10 @@ class PDFExtractor:
         merged_paragraphs = self._merge_pages_paragraphs(page_paragraphs)
 
         # Convert all merged paragraphs to markdown
-        markdown_parts = self._paragraphs_to_markdown(merged_paragraphs)
+        # Pass all_blocks for baseline font size calculation
+        markdown_parts = self._paragraphs_to_markdown(
+            merged_paragraphs, all_blocks
+        )
 
         # Join with double newlines between paragraphs
         return '\n\n'.join(markdown_parts)
