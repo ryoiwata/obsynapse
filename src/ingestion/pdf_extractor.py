@@ -36,6 +36,7 @@ class PDFExtractor:
         """
         self.pdf_path = pdf_path
         self.doc = fitz.open(pdf_path)
+        self.known_titles = set()
 
     def _is_monospaced_font(self, font_name: str) -> bool:
         """
@@ -374,6 +375,35 @@ class PDFExtractor:
         baseline = max(font_size_counts.items(), key=lambda x: x[1])[0]
         return baseline
 
+    def _is_running_header(self, text: str) -> bool:
+        """
+        Check if a text is a running header/footer.
+
+        Running headers typically contain a pipe delimiter (|) with a page
+        number on one side and a known section title on the other, like
+        "Chapter 1: Introduction | 15" or "2 | Chapter 1".
+
+        Args:
+            text: The text to check
+
+        Returns:
+            True if the text is a running header, False otherwise
+        """
+        if '|' not in text:
+            return False
+
+        parts = [p.strip().lower() for p in text.split('|')]
+        if len(parts) < 2:
+            return False
+
+        # Check if one part is a digit and the other is a title we've seen
+        has_digit = any(p.isdigit() for p in parts)
+        matches_known = any(
+            any(p == t.lower() for t in self.known_titles) for p in parts
+        )
+
+        return has_digit and matches_known
+
     def _is_header_paragraph(
         self, paragraph: List[Dict], baseline_font_size: float,
         prev_paragraph: List[Dict] = None
@@ -394,18 +424,20 @@ class PDFExtractor:
         if not paragraph:
             return False, 0
 
-        # Extract full text of the paragraph
-        paragraph_text = ' '.join(block['text'] for block in paragraph).strip()
+        # Extract text for running header check
+        paragraph_text = ' '.join(
+            block['text'] for block in paragraph
+        ).strip()
 
-        # Check for running headers/footers containing a pipe and a page number
-        # Running headers like "2 | Chapter 1" or "Title | 15" should be
-        # excluded. Check this first before other validations.
+        # Simple check: if it contains pipe and digit, it's likely a running
+        # header (we don't have known_titles here, so use simple heuristic)
         if '|' in paragraph_text:
             parts = [p.strip() for p in paragraph_text.split('|')]
-            # If any part of the pipe-split text is a digit,
-            # it's a running header
             if any(part.isdigit() for part in parts):
                 return False, 0
+
+        # Extract full text of the paragraph
+        paragraph_text = ' '.join(block['text'] for block in paragraph).strip()
 
         # Exclude table and figure captions from being treated as headers
         # Check if text starts with common caption labels (case-insensitive)
@@ -510,6 +542,50 @@ class PDFExtractor:
 
         return is_header, header_level
 
+    def _remove_running_header_from_text(self, text: str) -> str:
+        """
+        Remove running header portion from text if it contains one.
+
+        If text contains a running header pattern (pipe with digit and
+        known title), remove that portion and return the remaining content.
+
+        Args:
+            text: Text that may contain a running header
+
+        Returns:
+            Text with running header removed, or original text if no
+            running header
+        """
+        if '|' not in text:
+            return text
+
+        # Pattern: text | number or number | text where text matches
+        # known title
+        parts = text.split('|')
+        if len(parts) < 2:
+            return text
+
+        # Check each part to see if it matches a known title
+        cleaned_parts = []
+        for part in parts:
+            part_stripped = part.strip().lower()
+            # If this part is a digit, it's likely part of a running header
+            if part_stripped.isdigit():
+                continue
+            # If this part matches a known title, it's likely part of
+            # a running header
+            if any(part_stripped == t.lower() for t in self.known_titles):
+                continue
+            # Otherwise, keep it
+            cleaned_parts.append(part)
+
+        # If we removed parts, join the remaining ones
+        if len(cleaned_parts) < len(parts):
+            result = ' '.join(cleaned_parts).strip()
+            return result if result else text
+
+        return text
+
     def _paragraphs_to_markdown(
         self, paragraphs: List[List[Dict]], all_blocks: List[Dict] = None
     ) -> List[str]:
@@ -543,19 +619,14 @@ class PDFExtractor:
 
         prev_paragraph = None
         for paragraph in paragraphs:
-            # Extract paragraph text for running header check
+            # Extract paragraph text for checks
             paragraph_text = ' '.join(
                 block['text'] for block in paragraph
             ).strip()
 
             # Skip running headers/footers entirely (remove from output)
-            # Check for pipe and page number pattern
-            if '|' in paragraph_text:
-                parts = [p.strip() for p in paragraph_text.split('|')]
-                # If any part of the pipe-split text is a digit,
-                # it's a running header - skip it completely
-                if any(part.isdigit() for part in parts):
-                    continue
+            if self._is_running_header(paragraph_text):
+                continue
 
             # Check if paragraph contains monospaced text
             paragraph_is_monospaced = any(
@@ -590,13 +661,24 @@ class PDFExtractor:
                     current_code_block = []
                     in_code_block = False
 
-                # Get paragraph text
-                paragraph_text = ' '.join(
-                    block['text'] for block in paragraph
-                ).strip()
-
                 if paragraph_text:
+                    # Check if text contains a running header that was merged
+                    # into a larger block - remove it if found
+                    cleaned_text = self._remove_running_header_from_text(
+                        paragraph_text
+                    )
+                    if not cleaned_text or cleaned_text != paragraph_text:
+                        # If we removed a running header, skip if nothing
+                        # remains
+                        if not cleaned_text:
+                            continue
+                        paragraph_text = cleaned_text
+
                     if is_header:
+                        # Track this as a known title for running header
+                        # detection
+                        self.known_titles.add(paragraph_text)
+
                         # Format as Markdown header
                         header_prefix = '#' * header_level
                         markdown_parts.append(
@@ -663,6 +745,30 @@ class PDFExtractor:
 
         # Merge paragraphs across page boundaries where appropriate
         merged_paragraphs = self._merge_pages_paragraphs(page_paragraphs)
+
+        # First pass: identify structural headers to build
+        # self.known_titles set
+        # Calculate baseline font size for header detection
+        baseline_font_size = self._calculate_baseline_font_size(all_blocks)
+
+        prev_para = None
+        for paragraph in merged_paragraphs:
+            # Check if paragraph is a header (skip monospaced)
+            paragraph_is_monospaced = any(
+                block['is_monospaced'] for block in paragraph
+            )
+            if not paragraph_is_monospaced:
+                is_header, header_level = self._is_header_paragraph(
+                    paragraph, baseline_font_size, prev_para
+                )
+                if is_header:
+                    # Extract text and add to known titles
+                    paragraph_text = ' '.join(
+                        block['text'] for block in paragraph
+                    ).strip()
+                    if paragraph_text:
+                        self.known_titles.add(paragraph_text)
+            prev_para = paragraph
 
         # Convert all merged paragraphs to markdown
         # Pass all_blocks for baseline font size calculation
