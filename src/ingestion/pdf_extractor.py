@@ -38,6 +38,7 @@ class PDFExtractor:
         self.pdf_path = pdf_path
         self.doc = fitz.open(pdf_path)
         self.known_titles = set()
+        self.seen_titles = set()
 
     def _is_monospaced_font(self, font_name: str) -> bool:
         """
@@ -392,6 +393,66 @@ class PDFExtractor:
         baseline = max(font_size_counts.items(), key=lambda x: x[1])[0]
         return baseline
 
+    def _normalize_for_comparison(self, text: str) -> str:
+        """
+        Normalize text for fuzzy comparison by removing non-alphanumeric
+        characters.
+
+        Converts text to lowercase and removes all non-alphanumeric characters
+        (including colons, dashes, pipes, and extra spaces) for fuzzy matching
+        of headers that may have punctuation differences.
+
+        Args:
+            text: Text to normalize
+
+        Returns:
+            Normalized string with only lowercase alphanumeric characters
+        """
+        # Remove all non-alphanumeric characters and convert to lowercase
+        return re.sub(r'[^a-z0-9]', '', text.lower())
+
+    def _find_title_end_position(self, text: str, title: str) -> int:
+        """
+        Find the end position of a normalized title in the original text.
+
+        Uses normalized comparison to match the title, then finds where it
+        actually ends in the original text (accounting for punctuation).
+
+        Args:
+            text: Text that may contain the title at the start
+            title: Title to find (will be normalized for comparison)
+
+        Returns:
+            Character position where the title ends, or 0 if not found
+        """
+        if not text or not title:
+            return 0
+
+        text_normalized = self._normalize_for_comparison(text)
+        title_normalized = self._normalize_for_comparison(title)
+
+        if not text_normalized.startswith(title_normalized):
+            return 0
+
+        # Find where the title ends by matching words
+        words = text.split()
+        title_words = title.split()
+
+        # Try to find the longest matching prefix
+        for n in range(min(len(words), len(title_words) + 10), 0, -1):
+            candidate = ' '.join(words[:n])
+            if self._normalize_for_comparison(candidate) == title_normalized:
+                # Found exact match - return the end position
+                candidate_text = ' '.join(words[:n])
+                # Find this in the original text (accounting for whitespace)
+                pos = text.find(candidate_text)
+                if pos != -1:
+                    return pos + len(candidate_text)
+                # Fallback: calculate approximate position
+                return len(candidate_text)
+
+        return 0
+
     def _is_running_header(
         self, text: str, paragraph: List[Dict] = None
     ) -> bool:
@@ -412,45 +473,56 @@ class PDFExtractor:
             True if the text is a running header, False otherwise
         """
         text_stripped = text.strip()
-        text_lower = text_stripped.lower()
 
         # Check if it's just a page number (standalone digits)
         if text_stripped.isdigit():
             return True
 
+        # Check for pipe patterns with advanced normalization
+        if '|' in text:
+            parts = [p.strip() for p in text.split('|')]
+            if len(parts) >= 2:
+                normalized_parts = [
+                    self._normalize_for_comparison(p) for p in parts
+                ]
+
+                for i, norm_p in enumerate(normalized_parts):
+                    # Check if this part matches a known title (fuzzy)
+                    is_title = any(
+                        norm_p == self._normalize_for_comparison(t)
+                        for t in self.known_titles
+                    )
+                    # Check if the OTHER part is just a number
+                    other_part_is_num = parts[1 - i].strip().isdigit()
+
+                    if is_title and other_part_is_num:
+                        return True
+
+                # Also check if both parts are just digits (page numbers)
+                if all(p.strip().isdigit() for p in parts):
+                    return True
+
         # Check if text is in header/footer region and matches known title
+        # (using normalized comparison)
         if paragraph:
             is_header_footer = any(
                 block.get('is_header_footer', False) for block in paragraph
             )
             if is_header_footer:
-                # Check if it matches a known title
+                # Check if it matches a known title (normalized)
+                text_normalized = self._normalize_for_comparison(text_stripped)
                 for title in self.known_titles:
-                    if text_lower == title.lower():
+                    if text_normalized == self._normalize_for_comparison(
+                        title
+                    ):
                         return True
 
-        # Check for pipe patterns (original logic)
-        if '|' in text:
-            parts = [p.strip().lower() for p in text.split('|')]
-            if len(parts) >= 2:
-                # Check if one part is a digit and the other is a title
-                has_digit = any(p.isdigit() for p in parts)
-                matches_known = any(
-                    any(p == t.lower() for t in self.known_titles)
-                    for p in parts
-                )
-                if has_digit and matches_known:
-                    return True
-
-                # Also check if both parts are just digits (page numbers)
-                if all(p.isdigit() for p in parts):
-                    return True
-
-        # Check if text exactly matches a known title
+        # Check if text matches a known title (normalized comparison)
         # (but not if it's an actual header)
         # This catches running headers that appear in the middle of content
+        text_normalized = self._normalize_for_comparison(text_stripped)
         for title in self.known_titles:
-            if text_lower == title.lower():
+            if text_normalized == self._normalize_for_comparison(title):
                 # If it's in header/footer region, it's definitely
                 # running header
                 if paragraph and any(
@@ -603,8 +675,11 @@ class PDFExtractor:
                 is_header = False
                 header_level = 0
 
-        # Note: We do NOT add to known_titles here anymore.
-        # That will be done in _paragraphs_to_markdown with first-seen logic.
+        # If this is a header, add original text to known_titles
+        # for fuzzy matching of running headers (we normalize when comparing)
+        if is_header and paragraph_text:
+            self.known_titles.add(paragraph_text.strip())
+
         return is_header, header_level
 
     def _strip_running_header(self, text: str) -> str:
@@ -661,20 +736,23 @@ class PDFExtractor:
 
         text = text.strip()
 
-        # First, handle pipe patterns
+        # First, handle pipe patterns using normalized comparison
         if '|' in text:
             parts = [p.strip() for p in text.split('|')]
             if len(parts) >= 2:
                 cleaned_parts = []
                 for part in parts:
-                    part_stripped = part.strip().lower()
+                    part_stripped = part.strip()
                     # Skip if it's just a digit (page number)
                     if part_stripped.isdigit():
                         continue
-                    # Skip if it matches a known title
-                    if any(
-                        part_stripped == t.lower() for t in self.known_titles
-                    ):
+                    # Skip if it matches a known title (using normalized comparison)
+                    part_normalized = self._normalize_for_comparison(part_stripped)
+                    is_title = any(
+                        part_normalized == self._normalize_for_comparison(t)
+                        for t in self.known_titles
+                    )
+                    if is_title:
                         continue
                     # Otherwise, keep it
                     cleaned_parts.append(part)
@@ -818,6 +896,13 @@ class PDFExtractor:
         (including any associated pipe | and page numbers) but keeps
         any substantive content that follows.
 
+        Handles patterns like:
+        - "14 | Chapter 1: Introduction..." -> "Figure 1-6..."
+        - "Chapter 1: Introduction | 14 Figure..." -> "Figure..."
+        - "Chapter 1: Introduction Figure..." -> "Figure..."
+
+        Uses normalized comparison to match titles, ignoring punctuation.
+
         Args:
             text: Text that may start with a running header
 
@@ -829,26 +914,173 @@ class PDFExtractor:
             return text
 
         text_stripped = text.strip()
-        text_lower = text_stripped.lower()
+        if not text_stripped:
+            return text
 
+        # First, handle pipe patterns at the start:
+        # "14 | Title..." or "Title | 14 ..."
+        if '|' in text_stripped:
+            # Split by first pipe only
+            pipe_pos = text_stripped.find('|')
+            if pipe_pos != -1:
+                before_pipe = text_stripped[:pipe_pos].strip()
+                after_pipe = text_stripped[pipe_pos + 1:].strip()
+
+                # Pattern 1: "14 | Title..."
+                if before_pipe.isdigit():
+                    # Check if after_pipe starts with known title (normalized)
+                    for title in sorted(
+                        self.known_titles, key=len, reverse=True
+                    ):
+                        after_norm = self._normalize_for_comparison(after_pipe)
+                        title_norm = self._normalize_for_comparison(title)
+
+                        if after_norm.startswith(title_norm):
+                            # Find where title ends in after_pipe
+                            words = after_pipe.split()
+                            title_words = title.split()
+
+                            # Try to find matching prefix
+                            max_n = min(len(words), len(title_words) + 10)
+                            for n in range(max_n, 0, -1):
+                                candidate = ' '.join(words[:n])
+                                cand_norm = self._normalize_for_comparison(
+                                    candidate
+                                )
+                                if cand_norm == title_norm:
+                                    # Found match - return remaining words
+                                    remaining = ' '.join(words[n:]).strip()
+                                    # Remove any leading page numbers
+                                    remaining = re.sub(
+                                        r'^[\s|]*\d+[\s|]*', '', remaining
+                                    ).strip()
+                                    if remaining:
+                                        return remaining
+                                    break
+
+                # Pattern 2: "Title | 14 ..."
+                # Check if before_pipe starts with known title
+                # and after_pipe starts with a number
+                if after_pipe:
+                    after_words = after_pipe.split()
+                    if after_words and after_words[0].isdigit():
+                        for title in sorted(
+                            self.known_titles, key=len, reverse=True
+                        ):
+                            before_norm = self._normalize_for_comparison(
+                                before_pipe
+                            )
+                            title_norm = self._normalize_for_comparison(title)
+
+                            if before_norm.startswith(title_norm):
+                                # Find where title ends in before_pipe
+                                words = before_pipe.split()
+                                title_words = title.split()
+
+                                max_n = min(len(words), len(title_words) + 10)
+                                for n in range(max_n, 0, -1):
+                                    candidate = ' '.join(words[:n])
+                                    cand_norm = self._normalize_for_comparison(
+                                        candidate
+                                    )
+                                    if cand_norm == title_norm:
+                                        # Title matches - remove pipe pattern
+                                        # Return what comes after pipe/number
+                                        after_clean = re.sub(
+                                            r'^\d+[\s|]*', '', after_pipe
+                                        ).strip()
+                                        if after_clean:
+                                            return after_clean
+                                        break
+
+        # Handle non-pipe patterns: text starting with a known title
         # Sort titles by length descending to catch longest matches first
+        text_normalized = self._normalize_for_comparison(text_stripped)
         for title in sorted(self.known_titles, key=len, reverse=True):
-            # Check if text starts with this title (case-insensitive)
-            if text_lower.startswith(title.lower()):
-                # Strip the known header and associated page number/pipe
-                # Pattern: title, optional whitespace, optional pipe,
-                # optional digits, optional pipe, optional whitespace
-                pattern = re.compile(
-                    rf"^{re.escape(title)}[\s|]*\d*[\s|]*",
-                    re.IGNORECASE
-                )
-                remaining_text = pattern.sub("", text_stripped).strip()
-                # Only return stripped text if there's substantive content
-                # (more than just whitespace/punctuation)
-                if remaining_text and len(remaining_text.split()) > 0:
-                    return remaining_text
+            title_normalized = self._normalize_for_comparison(title)
+
+            if text_normalized.startswith(title_normalized):
+                # Find where the title actually ends in the original text
+                words = text_stripped.split()
+                title_words = title.split()
+
+                # Try to find the longest matching prefix
+                max_n = min(len(words), len(title_words) + 10)
+                for n in range(max_n, 0, -1):
+                    candidate = ' '.join(words[:n])
+                    if (self._normalize_for_comparison(candidate) ==
+                            title_normalized):
+                        # Found exact match - remove these words
+                        remaining = ' '.join(words[n:]).strip()
+                        # Also remove any leading pipe or page numbers
+                        remaining = re.sub(
+                            r'^[\s|]*\d+[\s|]*', '', remaining
+                        ).strip()
+                        if remaining and len(remaining.split()) > 0:
+                            return remaining
+                        break
 
         return text
+
+    def _clean_paragraph_text(self, text: str) -> str:
+        """
+        Clean paragraph text by removing duplicate headers.
+
+        Removes:
+        1. Exact matches of seen titles (standalone duplicates) using normalized comparison
+        2. Merged headers at the start of paragraphs (including pipe patterns)
+
+        Args:
+            text: Text that may contain duplicate headers
+
+        Returns:
+            Cleaned text, or empty string if entire text was a duplicate
+        """
+        if not text or not text.strip():
+            return text.strip()
+
+        text_stripped = text.strip()
+
+        # 1. Check for exact matches (standalone duplicates) using normalized comparison
+        text_normalized = self._normalize_for_comparison(text_stripped)
+        for seen_title in self.seen_titles:
+            seen_normalized = self._normalize_for_comparison(seen_title)
+            if text_normalized == seen_normalized:
+                return ""
+
+        # 2. Use _strip_merged_header to remove merged headers at start
+        # This handles both pipe patterns and direct title matches
+        cleaned = self._strip_merged_header(text_stripped)
+
+        # If _strip_merged_header found and removed a header, return cleaned
+        if cleaned != text_stripped:
+            return cleaned.strip()
+
+        # 3. Fallback: Check for merged headers using normalized comparison
+        # Sort titles by length descending to avoid partial matches
+        sorted_titles = sorted(self.seen_titles, key=len, reverse=True)
+        for title in sorted_titles:
+            # Use normalized comparison to match titles
+            title_normalized = self._normalize_for_comparison(title)
+            if text_normalized.startswith(title_normalized):
+                # Find where title ends and remove it
+                words = text_stripped.split()
+                title_words = title.split()
+                max_n = min(len(words), len(title_words) + 10)
+                for n in range(max_n, 0, -1):
+                    candidate = ' '.join(words[:n])
+                    if (self._normalize_for_comparison(candidate) ==
+                            title_normalized):
+                        remaining = ' '.join(words[n:]).strip()
+                        # Remove any leading pipe or page numbers
+                        remaining = re.sub(
+                            r'^[\s|]*\d+[\s|]*', '', remaining
+                        ).strip()
+                        if remaining:
+                            return remaining
+                        break
+
+        return text_stripped
 
     def _paragraphs_to_markdown(
         self, paragraphs: List[List[Dict]], all_blocks: List[Dict] = None
@@ -927,49 +1159,58 @@ class PDFExtractor:
                     in_code_block = False
 
                 if paragraph_text:
-                    # STRICT ORDERING: Handle headers first, before
-                    # checking against known_titles for removal
+                    # Case A: Standalone Header
                     if is_header:
                         # This is a structural header
-                        normalized_title = paragraph_text.strip().lower()
-                        if normalized_title not in self.known_titles:
-                            # First occurrence - add to known_titles and
-                            # keep it
-                            self.known_titles.add(normalized_title)
+                        # Use normalized comparison for seen_titles check
+                        normalized_title = self._normalize_for_comparison(
+                            paragraph_text
+                        )
+                        # Check if we've seen this normalized title before
+                        seen_before = any(
+                            normalized_title ==
+                            self._normalize_for_comparison(seen)
+                            for seen in self.seen_titles
+                        )
+                        if seen_before:
+                            # Already seen - skip duplicate standalone header
+                            continue
+                        else:
+                            # First occurrence - add original text to
+                            # seen_titles and keep it
+                            self.seen_titles.add(paragraph_text.strip())
+                            # Normalized version already added to known_titles
+                            # in _is_header_paragraph
                             header_prefix = '#' * header_level
                             markdown_parts.append(
                                 f'{header_prefix} {paragraph_text}'
                             )
-                        # else: Skip duplicate standalone headers
-                        # (don't add to output)
                     else:
-                        # Not a standalone header - check if a known header
-                        # is merged at the start
-                        cleaned_text = (
-                            self._strip_merged_header(paragraph_text)
+                        # Case B: Not a standalone header - check for merged
+                        # headers at the start
+                        # Use _strip_merged_header first to handle pipe patterns
+                        # This will strip headers while preserving content after
+                        paragraph_text = self._strip_merged_header(
+                            paragraph_text
                         )
-                        if cleaned_text and cleaned_text != paragraph_text:
-                            # Header was stripped, use the remaining content
-                            paragraph_text = cleaned_text
-                        else:
-                            # Also try the more general removal method
-                            # for edge cases
-                            cleaned_text = (
-                                self._remove_running_headers(paragraph_text)
-                            )
-                            if cleaned_text and cleaned_text != paragraph_text:
-                                paragraph_text = cleaned_text
+
+                        # If entire paragraph was stripped, skip it
+                        if not paragraph_text or not paragraph_text.strip():
+                            continue
+
+                        # Clean merged headers at start (handles extra cases)
+                        cleaned_text = self._clean_paragraph_text(paragraph_text)
 
                         # Skip if paragraph is empty after cleaning
-                        if not paragraph_text:
+                        if not cleaned_text:
                             continue
 
                         # Skip if it's clearly a running header
-                        if self._is_running_header(paragraph_text, paragraph):
+                        if self._is_running_header(cleaned_text, paragraph):
                             continue
 
                         # Add regular paragraph
-                        markdown_parts.append(paragraph_text)
+                        markdown_parts.append(cleaned_text)
 
             # Update previous paragraph for spacing checks
             prev_paragraph = paragraph
