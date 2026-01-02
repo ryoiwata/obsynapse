@@ -1127,6 +1127,102 @@ class PDFExtractor:
 
         return True
 
+    def _split_paragraph_into_lines(self, paragraph: List[Dict]) -> List[List[Dict]]:
+        """
+        Split a paragraph into visual lines based on Y-coordinate tolerance.
+
+        Groups blocks within a paragraph into lines using the same LINE_TOLERANCE
+        concept from _sort_blocks_by_position. This allows line-level filtering
+        of numeric prefix footnotes without removing entire paragraphs.
+
+        Args:
+            paragraph: List of text block dictionaries representing a paragraph
+
+        Returns:
+            List of lines, where each line is a list of blocks
+        """
+        if not paragraph:
+            return []
+
+        # Tolerance for grouping blocks into the same line (in pixels)
+        # Reuse the same value from _sort_blocks_by_position
+        LINE_TOLERANCE = 3.0
+
+        # Sort blocks by Y-coordinate
+        blocks_sorted_by_y = sorted(paragraph, key=lambda b: b.get('y_pos', 0))
+
+        # Group blocks into lines based on Y-coordinate tolerance
+        lines = []
+        current_line = []
+        current_line_y = None
+
+        for block in blocks_sorted_by_y:
+            block_y = block.get('y_pos', 0)
+
+            # If this is the first block or Y is within tolerance, add to current line
+            if (current_line_y is None or
+                    abs(block_y - current_line_y) <= LINE_TOLERANCE):
+                current_line.append(block)
+                if current_line_y is None:
+                    current_line_y = block_y
+                else:
+                    current_line_y = min(current_line_y, block_y)
+            else:
+                # Y difference exceeds tolerance, start a new line
+                if current_line:
+                    # Sort current line by X-coordinate (left to right)
+                    current_line.sort(key=lambda b: b.get('bbox', [0, 0, 0, 0])[0])
+                    lines.append(current_line)
+                current_line = [block]
+                current_line_y = block_y
+
+        # Don't forget the last line
+        if current_line:
+            current_line.sort(key=lambda b: b.get('bbox', [0, 0, 0, 0])[0])
+            lines.append(current_line)
+
+        return lines
+
+    def _filter_numeric_prefix_lines(
+        self, lines: List[List[Dict]]
+    ) -> List[List[Dict]]:
+        """
+        Filter out lines that match the numeric prefix pattern.
+
+        For each line, checks if the combined text matches the numeric prefix
+        pattern. If it does, the line is removed. Otherwise, it is kept.
+
+        Args:
+            lines: List of lines, where each line is a list of blocks
+
+        Returns:
+            List of lines with numeric prefix lines removed
+
+        Example:
+            Input paragraph lines:
+            - "1 In this book, I use traditional ML..."
+            - "The statistical nature of languages was discovered centuries ago..."
+
+            After filtering:
+            - "The statistical nature of languages was discovered centuries ago..."
+            (first line removed, second line preserved)
+        """
+        filtered_lines = []
+        for line in lines:
+            # Compute line text from all blocks in the line
+            line_text = ' '.join(
+                block.get('text', '') for block in line
+            ).strip()
+
+            # Skip lines that match the numeric prefix pattern
+            if self._is_numeric_prefix_line(line_text):
+                continue
+
+            # Keep all other lines
+            filtered_lines.append(line)
+
+        return filtered_lines
+
     def _clean_footnotes(self, text: str) -> str:
         """
         Strict final pass to remove numeric prefix lines from markdown text.
@@ -1228,20 +1324,41 @@ class PDFExtractor:
 
         prev_paragraph = None
         for paragraph in paragraphs:
-            # Extract paragraph text for checks
+            # Split paragraph into visual lines for line-level filtering
+            # This allows us to remove numeric prefix footnote lines without
+            # deleting entire paragraphs that contain real content
+            lines = self._split_paragraph_into_lines(paragraph)
+
+            # Filter out numeric prefix lines at the line level
+            filtered_lines = self._filter_numeric_prefix_lines(lines)
+            removed_count = len(lines) - len(filtered_lines)
+            if removed_count > 0:
+                numeric_footnote_count += removed_count
+
+            # If all lines were removed, skip this paragraph
+            if not filtered_lines:
+                continue
+
+            # Reconstruct paragraph from remaining lines
+            # Join blocks within each line, then join lines with spaces
+            paragraph_blocks = []
+            for line in filtered_lines:
+                paragraph_blocks.extend(line)
+
+            # If no blocks remain after filtering, skip
+            if not paragraph_blocks:
+                continue
+
+            # Extract paragraph text from filtered blocks
             paragraph_text = ' '.join(
-                block['text'] for block in paragraph
+                block.get('text', '') for block in paragraph_blocks
             ).strip()
 
             if not paragraph_text:
                 continue
 
-            # Strict numeric prefix check: remove any paragraph matching the pattern
-            # This must happen BEFORE any other checks (monospaced/header/running-header)
-            # and does NOT depend on footer region flags
-            if self._is_numeric_prefix_line(paragraph_text):
-                numeric_footnote_count += 1
-                continue
+            # Update paragraph to use filtered blocks for subsequent processing
+            paragraph = paragraph_blocks
 
             # Check if paragraph contains monospaced text
             paragraph_is_monospaced = any(
