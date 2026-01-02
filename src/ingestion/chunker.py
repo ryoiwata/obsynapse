@@ -8,6 +8,7 @@ This module implements a two-step chunking approach:
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -335,6 +336,17 @@ Examples:
     )
 
     parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=None,
+        help=(
+            "Output JSON file path "
+            "(default: input filename with .json extension)"
+        ),
+    )
+
+    parser.add_argument(
         "--log-file",
         type=str,
         default="ingestion.log",
@@ -376,6 +388,23 @@ Examples:
             logger.debug(f"  Content: {chunks[0]['content'][:200]}...")
             logger.debug(f"  Metadata: {chunks[0]['metadata']}")
 
+        # Determine output file path
+        if args.output is None:
+            # Default to input filename with .json extension
+            output_path = args.input.with_suffix(".json")
+        else:
+            output_path = Path(args.output)
+
+        # Save chunks to JSON file
+        try:
+            logger.info(f"Saving {len(chunks)} chunks to: {output_path}")
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(chunks, f, indent=2, ensure_ascii=False)
+            logger.info(f"Chunks saved successfully to: {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to save chunks to {output_path}: {e}")
+            return 1
+
         return 0
 
     except FileNotFoundError as e:
@@ -388,4 +417,3 @@ Examples:
 
 if __name__ == "__main__":
     sys.exit(main())
-
