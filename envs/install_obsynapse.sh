@@ -69,6 +69,29 @@ conda install conda-forge::markdown-it-py --yes
 conda install conda-forge::pydantic --yes
 
 
+# pyyaml: YAML parser and emitter for Python
+# Used for parsing configuration files and YAML frontmatter in markdown files
 conda install conda-forge::pyyaml --yes
 
+# pymupdf (PyMuPDF): Fast PDF processing library
+# Used by pdf_extractor.py to extract text from PDF files with markdown formatting
 pip install --upgrade pymupdf
+
+# pdfplumber: PDF text extraction library
+# Alternative PDF processing option for extracting structured data from PDF documents
+conda install conda-forge::pdfplumber --yes
+
+# langchain: Framework for building LLM applications
+# Used for text splitting (MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter)
+# and integration with vector stores for the hierarchical chunking pipeline
+conda install conda-forge::langchain --yes
+
+# langgraph: Library for building stateful, multi-actor applications with LLMs
+# Used for orchestrating the flashcard generation workflow (Generator-Critic loop)
+# and managing state transitions in the Agentic Forge pipeline
+conda install conda-forge::langgraph --yes
+
+# weaviate-client: Python client for Weaviate vector database
+# Used for storing and querying book content chunks with hybrid search (vector + keyword)
+# Supports the RAG pipeline for flashcard generation from ingested book chapters
+conda install conda-forge::weaviate-client --yes
