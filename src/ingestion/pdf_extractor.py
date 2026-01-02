@@ -1082,6 +1082,116 @@ class PDFExtractor:
 
         return text_stripped
 
+    def _is_numeric_prefix_line(self, text: str) -> bool:
+        """
+        Check if text matches the strict numeric prefix pattern.
+
+        Matches lines that start with one or more digits, followed by whitespace,
+        followed by any non-empty text (e.g., "2 For non-English languages...").
+
+        This method does NOT match numbered list items (e.g., "1. Step one")
+        by ensuring there is NO period directly after the number.
+
+        Args:
+            text: The text to check
+
+        Returns:
+            True if the text matches the numeric prefix pattern, False otherwise
+
+        Examples:
+            >>> _is_numeric_prefix_line("2 For non-English languages...")
+            True
+            >>> _is_numeric_prefix_line("3 Autoregressive language models...")
+            True
+            >>> _is_numeric_prefix_line("1. Step one")
+            False
+            >>> _is_numeric_prefix_line("14 Chapter title continues...")
+            True
+        """
+        if not text or not text.strip():
+            return False
+
+        text_stripped = text.strip()
+
+        # Pattern: starts with digit(s), whitespace, then any non-whitespace char
+        # This matches: "2 For non-English...", "3 Autoregressive...", etc.
+        numeric_prefix_pattern = re.compile(r"^\d+\s+\S")
+        if not numeric_prefix_pattern.match(text_stripped):
+            return False
+
+        # Crucial: exclude numbered list items by checking for period after number
+        # Pattern: digit(s) followed by period and space (e.g., "1. Step one")
+        numbered_list_pattern = re.compile(r"^\d+\.\s+")
+        if numbered_list_pattern.match(text_stripped):
+            return False
+
+        return True
+
+    def _clean_footnotes(self, text: str) -> str:
+        """
+        Strict final pass to remove numeric prefix lines from markdown text.
+
+        Removes any entire paragraph line that matches the numeric prefix pattern:
+        - Starts with one or more digits
+        - Followed by whitespace
+        - Followed by any non-empty text
+        - Does NOT match numbered lists (e.g., "1. Step one")
+
+        This is a defensive cleanup pass that catches any numeric prefix lines
+        that may have slipped through earlier processing.
+
+        Args:
+            text: Markdown text that may contain numeric prefix lines
+
+        Returns:
+            Text with numeric prefix lines removed and normalized blank lines
+        """
+        if not text:
+            return text
+
+        # Pattern to match numeric prefix lines: ^\d+\s+\S.*$
+        # ^: Start of line
+        # \d+: One or more digits
+        # \s+: One or more whitespace characters
+        # \S: Any non-whitespace character (ensures there's content after space)
+        # .*$: Rest of the line
+        numeric_prefix_pattern = re.compile(
+            r"^\d+\s+\S.*$", re.MULTILINE
+        )
+
+        footnote_count = 0
+
+        def should_remove_line(match: re.Match) -> str:
+            """
+            Determine if a matched line should be removed.
+
+            Args:
+                match: Regex match object
+
+            Returns:
+                Empty string if should be removed, original match if not
+            """
+            nonlocal footnote_count
+            line = match.group(0).strip()
+
+            # Exclude numbered list items (e.g., "1. Step one")
+            # Pattern: digit(s) followed by period and space
+            numbered_list_pattern = re.compile(r"^\d+\.\s+")
+            if numbered_list_pattern.match(line):
+                return match.group(0)  # Keep numbered lists
+
+            # Remove this line (matches numeric prefix pattern)
+            footnote_count += 1
+            return ""
+
+        # Replace matched lines with empty string
+        cleaned_text = numeric_prefix_pattern.sub(should_remove_line, text)
+
+        # Normalize excessive blank lines (3+ newlines -> 2 newlines)
+        cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
+
+        return cleaned_text
+
     def _paragraphs_to_markdown(
         self, paragraphs: List[List[Dict]], all_blocks: List[Dict] = None
     ) -> List[str]:
@@ -1113,6 +1223,9 @@ class PDFExtractor:
         current_code_block = []
         in_code_block = False
 
+        # Track numeric footnotes removed for logging
+        numeric_footnote_count = 0
+
         prev_paragraph = None
         for paragraph in paragraphs:
             # Extract paragraph text for checks
@@ -1121,6 +1234,13 @@ class PDFExtractor:
             ).strip()
 
             if not paragraph_text:
+                continue
+
+            # Strict numeric prefix check: remove any paragraph matching the pattern
+            # This must happen BEFORE any other checks (monospaced/header/running-header)
+            # and does NOT depend on footer region flags
+            if self._is_numeric_prefix_line(paragraph_text):
+                numeric_footnote_count += 1
                 continue
 
             # Check if paragraph contains monospaced text
@@ -1220,6 +1340,14 @@ class PDFExtractor:
             code_text = '\n'.join(current_code_block)
             markdown_parts.append(f'```\n{code_text}\n```')
 
+        # Log numeric footnotes removed
+        if numeric_footnote_count > 0:
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"Removed {numeric_footnote_count} numeric footnote "
+                f"paragraph(s) during markdown conversion"
+            )
+
         return markdown_parts
 
     def extract(self) -> str:
@@ -1281,7 +1409,12 @@ class PDFExtractor:
         )
 
         # Join with double newlines between paragraphs
-        return '\n\n'.join(markdown_parts)
+        markdown_text = '\n\n'.join(markdown_parts)
+
+        # Clean footnotes from the final markdown
+        markdown_text = self._clean_footnotes(markdown_text)
+
+        return markdown_text
 
     def _merge_pages_paragraphs(
         self, page_paragraphs: List[List[List[Dict]]]
