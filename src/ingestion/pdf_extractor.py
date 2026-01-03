@@ -820,6 +820,60 @@ class PDFExtractor:
 
         return '\n'.join(cleaned_lines)
 
+    def _remove_leading_page_number_prefixes(self, markdown_text: str) -> str:
+        """
+        Remove leading page-number tokens that slipped into paragraph starts.
+        Skips markdown headers and fenced code blocks.
+        """
+        if not markdown_text:
+            return markdown_text
+
+        lines = markdown_text.split('\n')
+        cleaned: List[str] = []
+        in_code_block = False
+        at_paragraph_start = True
+        removed_once = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            if stripped.startswith('```'):
+                in_code_block = not in_code_block
+                cleaned.append(line)
+                at_paragraph_start = False
+                continue
+
+            if in_code_block:
+                cleaned.append(line)
+                continue
+
+            if stripped == '':
+                cleaned.append(line)
+                at_paragraph_start = True
+                continue
+
+            if self._is_markdown_header_line(line):
+                cleaned.append(line)
+                at_paragraph_start = False
+                continue
+
+            if at_paragraph_start:
+                if (not removed_once) and (
+                    match := re.match(r'^(\s*)(\d{1,3})\s+([A-Za-z])', line)
+                ):
+                    num = int(match.group(2))
+                    if 1 <= num <= 5000:
+                        if not re.match(r'^\s*\d{1,3}\s*[\.\):\]]', line):
+                            indent = match.group(1)
+                            rest = line[match.end(2):].lstrip()
+                            line = indent + rest
+                            removed_once = True
+
+            cleaned.append(line)
+            at_paragraph_start = False
+
+        return '\n'.join(cleaned)
+
     def extract(self) -> str:
         """
         Extract text from the PDF and return as Markdown-lite string.
@@ -879,6 +933,11 @@ class PDFExtractor:
 
         # Remove repeated running headers/footers that include pipes
         markdown_text = self._remove_repeated_pipe_headers(markdown_text)
+
+        # Remove stray page numbers merged into paragraph starts
+        markdown_text = self._remove_leading_page_number_prefixes(
+            markdown_text
+        )
 
         return markdown_text
 
