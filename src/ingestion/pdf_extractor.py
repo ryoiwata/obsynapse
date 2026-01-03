@@ -1135,10 +1135,10 @@ class PDFExtractor:
         concept from _sort_blocks_by_position. This allows line-level filtering
         of numeric prefix footnotes without removing entire paragraphs.
 
-        Args:
+            Args:
             paragraph: List of text block dictionaries representing a paragraph
 
-        Returns:
+            Returns:
             List of lines, where each line is a list of blocks
         """
         if not paragraph:
@@ -1183,105 +1183,217 @@ class PDFExtractor:
 
         return lines
 
-    def _filter_numeric_prefix_lines(
-        self, lines: List[List[Dict]]
+    def _line_text(self, line: List[Dict]) -> str:
+        """Get combined text from a line of blocks."""
+        return ' '.join(block.get('text', '') for block in line).strip()
+
+    def _line_y(self, line: List[Dict]) -> float:
+        """Get minimum Y position from a line of blocks."""
+        if not line:
+            return 0.0
+        return min(block.get('y_pos', 0.0) for block in line)
+
+    def _line_font_size(self, line: List[Dict]) -> float:
+        """Get average font size from a line of blocks."""
+        if not line:
+            return 0.0
+        sizes = [
+            block.get('font_size', 0.0) for block in line
+            if block.get('font_size', 0.0) > 0
+        ]
+        if not sizes:
+            return 0.0
+        return sum(sizes) / len(sizes)
+
+    def _line_left_x(self, line: List[Dict]) -> float:
+        """Get minimum left X position from a line of blocks."""
+        if not line:
+            return 0.0
+        return min(block.get('bbox', [0, 0, 0, 0])[0] for block in line)
+
+    def _filter_numeric_prefix_footnote_blocks(
+        self, lines: List[List[Dict]], baseline_font_size: float
     ) -> List[List[Dict]]:
         """
-        Filter out lines that match the numeric prefix pattern.
+        Filter out numeric prefix footnote blocks, including continuation lines.
 
-        For each line, checks if the combined text matches the numeric prefix
-        pattern. If it does, the line is removed. Otherwise, it is kept.
+        When a line matches the numeric prefix pattern, it's treated as the start
+        of a footnote block. All subsequent continuation lines are removed until
+        a stop condition is met (blank line, header, indentation shift, etc.).
 
         Args:
             lines: List of lines, where each line is a list of blocks
+            baseline_font_size: Baseline font size for the document
 
         Returns:
-            List of lines with numeric prefix lines removed
+            List of lines with numeric prefix footnote blocks removed
 
         Example:
-            Input paragraph lines:
-            - "1 In this book, I use traditional ML..."
-            - "The statistical nature of languages was discovered centuries ago..."
+            Input:
+            - "7 In school, ..."
+            - "we generally use model weights ..."
+            - "8 It seems counterintuitive ..."
+            - "shouldn't it require fewer examples ..."
 
-            After filtering:
-            - "The statistical nature of languages was discovered centuries ago..."
-            (first line removed, second line preserved)
+            Output: [] (all removed as footnote blocks)
         """
-        filtered_lines = []
-        for line in lines:
-            # Compute line text from all blocks in the line
-            line_text = ' '.join(
-                block.get('text', '') for block in line
-            ).strip()
+        if not lines:
+            return []
 
-            # Skip lines that match the numeric prefix pattern
-            if self._is_numeric_prefix_line(line_text):
+        filtered_lines = []
+        in_footnote_block = False
+        footnote_start_x = None
+        footnote_font_size = None
+        prev_line_y = None
+        X_THRESHOLD = 30.0  # Pixels for indentation shift detection
+
+        for i, line in enumerate(lines):
+            line_text = self._line_text(line)
+            line_y = self._line_y(line)
+            line_font_size = self._line_font_size(line)
+            line_left_x = self._line_left_x(line)
+
+            # Check if this line starts a new footnote block
+            is_numeric_prefix = self._is_numeric_prefix_line(line_text)
+
+            if is_numeric_prefix:
+                # Start of a new footnote block
+                in_footnote_block = True
+                footnote_start_x = line_left_x
+                footnote_font_size = line_font_size
+                # Drop this line
+                prev_line_y = line_y
                 continue
 
-            # Keep all other lines
-            filtered_lines.append(line)
+            if in_footnote_block:
+                # We're in a footnote block - check stop conditions
+
+                # Stop condition 1: Blank line
+                if not line_text:
+                    in_footnote_block = False
+                    # Don't keep blank line
+                    prev_line_y = line_y
+                    continue
+
+                # Stop condition 2: Numbered list item
+                numbered_list_pattern = re.compile(r"^\d+\.\s+")
+                if numbered_list_pattern.match(line_text):
+                    in_footnote_block = False
+                    filtered_lines.append(line)
+                    prev_line_y = line_y
+                    continue
+
+                # Stop condition 3: Header-like line (significantly
+                # larger font)
+                if (baseline_font_size > 0 and
+                        line_font_size >= baseline_font_size * 1.2):
+                    in_footnote_block = False
+                    filtered_lines.append(line)
+                    prev_line_y = line_y
+                    continue
+
+                # Stop condition 4: New paragraph indentation /
+                # left margin shift
+                if footnote_start_x is not None:
+                    x_diff = abs(line_left_x - footnote_start_x)
+                    if x_diff > X_THRESHOLD:
+                        in_footnote_block = False
+                        filtered_lines.append(line)
+                        prev_line_y = line_y
+                        continue
+
+                # Stop condition 5: Large vertical gap
+                if prev_line_y is not None and baseline_font_size > 0:
+                    y_diff = line_y - prev_line_y
+                    if y_diff > (baseline_font_size * 2.0):
+                        in_footnote_block = False
+                        filtered_lines.append(line)
+                        prev_line_y = line_y
+                        continue
+
+                # Continuation heuristic: if font size is close to baseline
+                # and left_x is close to footnote_start_x, assume continuation
+                is_continuation = False
+                if (footnote_start_x is not None and
+                        footnote_font_size is not None):
+                    x_close = (
+                        abs(line_left_x - footnote_start_x) <= X_THRESHOLD
+                    )
+                    font_similar = (
+                        baseline_font_size > 0 and
+                        line_font_size <= baseline_font_size * 1.1
+                    )
+                    if x_close and font_similar:
+                        is_continuation = True
+
+                if is_continuation:
+                    # Drop this continuation line
+                    prev_line_y = line_y
+                    continue
+                else:
+                    # Doesn't look like continuation - end footnote block
+                    in_footnote_block = False
+                    filtered_lines.append(line)
+                    prev_line_y = line_y
+            else:
+                # Not in a footnote block - keep the line
+                filtered_lines.append(line)
+                prev_line_y = line_y
 
         return filtered_lines
 
     def _clean_footnotes(self, text: str) -> str:
         """
-        Strict final pass to remove numeric prefix lines from markdown text.
+        Strict final pass to remove numeric prefix footnote blocks.
 
-        Removes any entire paragraph line that matches the numeric prefix pattern:
-        - Starts with one or more digits
-        - Followed by whitespace
-        - Followed by any non-empty text
-        - Does NOT match numbered lists (e.g., "1. Step one")
-
-        This is a defensive cleanup pass that catches any numeric prefix lines
-        that may have slipped through earlier processing.
+        Removes entire paragraphs that start with a numeric prefix line,
+        including all continuation lines. This ensures any leftover
+        continuation lines get removed even if earlier logic misses them.
 
         Args:
-            text: Markdown text that may contain numeric prefix lines
+            text: Markdown text that may contain numeric prefix blocks
 
         Returns:
-            Text with numeric prefix lines removed and normalized blank lines
+            Text with numeric prefix footnote blocks removed and normalized
         """
         if not text:
             return text
 
-        # Pattern to match numeric prefix lines: ^\d+\s+\S.*$
-        # ^: Start of line
-        # \d+: One or more digits
-        # \s+: One or more whitespace characters
-        # \S: Any non-whitespace character (ensures there's content after space)
-        # .*$: Rest of the line
-        numeric_prefix_pattern = re.compile(
-            r"^\d+\s+\S.*$", re.MULTILINE
-        )
+        # Split markdown into paragraphs by blank lines (double newlines)
+        paragraphs = re.split(r'\n\n+', text)
+        cleaned_paragraphs = []
+        removed_count = 0
 
-        footnote_count = 0
+        for para in paragraphs:
+            # Find the first non-empty line in the paragraph
+            lines = para.split('\n')
+            first_non_empty_line = None
+            for line in lines:
+                line_stripped = line.strip()
+                if line_stripped:
+                    first_non_empty_line = line_stripped
+                    break
 
-        def should_remove_line(match: re.Match) -> str:
-            """
-            Determine if a matched line should be removed.
+            # If the first non-empty line matches numeric prefix
+            # (excluding numbered lists), drop the entire paragraph
+            if first_non_empty_line:
+                # Check for numbered list pattern first
+                numbered_list_pattern = re.compile(r"^\d+\.\s+")
+                if numbered_list_pattern.match(first_non_empty_line):
+                    # Keep numbered lists
+                    cleaned_paragraphs.append(para)
+                elif self._is_numeric_prefix_line(first_non_empty_line):
+                    # Drop entire paragraph (footnote block)
+                    removed_count += 1
+                else:
+                    # Keep regular paragraphs
+                    cleaned_paragraphs.append(para)
+            else:
+                # Empty paragraph - keep it (will be normalized later)
+                cleaned_paragraphs.append(para)
 
-            Args:
-                match: Regex match object
-
-            Returns:
-                Empty string if should be removed, original match if not
-            """
-            nonlocal footnote_count
-            line = match.group(0).strip()
-
-            # Exclude numbered list items (e.g., "1. Step one")
-            # Pattern: digit(s) followed by period and space
-            numbered_list_pattern = re.compile(r"^\d+\.\s+")
-            if numbered_list_pattern.match(line):
-                return match.group(0)  # Keep numbered lists
-
-            # Remove this line (matches numeric prefix pattern)
-            footnote_count += 1
-            return ""
-
-        # Replace matched lines with empty string
-        cleaned_text = numeric_prefix_pattern.sub(should_remove_line, text)
+        # Join paragraphs back with double newlines
+        cleaned_text = '\n\n'.join(cleaned_paragraphs)
 
         # Normalize excessive blank lines (3+ newlines -> 2 newlines)
         cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
@@ -1329,8 +1441,10 @@ class PDFExtractor:
             # deleting entire paragraphs that contain real content
             lines = self._split_paragraph_into_lines(paragraph)
 
-            # Filter out numeric prefix lines at the line level
-            filtered_lines = self._filter_numeric_prefix_lines(lines)
+            # Filter out numeric prefix footnote blocks (including continuation lines)
+            filtered_lines = self._filter_numeric_prefix_footnote_blocks(
+                lines, baseline_font_size
+            )
             removed_count = len(lines) - len(filtered_lines)
             if removed_count > 0:
                 numeric_footnote_count += removed_count
