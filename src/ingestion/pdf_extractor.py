@@ -6,11 +6,12 @@ with special handling for monospaced fonts, page numbers, and reading order.
 """
 
 import fitz  # PyMuPDF
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 import argparse
 import logging
 import sys
 import os
+import re
 from datetime import datetime
 
 
@@ -598,6 +599,163 @@ class PDFExtractor:
 
         return markdown_parts
 
+    def _normalize_text(self, text: str) -> str:
+        """
+        Normalize text for comparison by casefolding, removing punctuation,
+        and collapsing whitespace.
+
+        Args:
+            text: Text to normalize
+
+        Returns:
+            Normalized string (lowercase, no punctuation, collapsed whitespace)
+        """
+        # Casefold to lowercase
+        normalized = text.casefold()
+        # Remove all non-alphanumeric characters except whitespace
+        normalized = re.sub(r'[^\w\s]', '', normalized)
+        # Collapse whitespace to single spaces
+        normalized = re.sub(r'\s+', ' ', normalized)
+        # Strip leading/trailing whitespace
+        return normalized.strip()
+
+    def _extract_header_title(self, line: str) -> str:
+        """
+        Extract and normalize the title from a markdown header line.
+
+        Args:
+            line: Markdown header line (e.g., "# Chapter 1: Intro")
+
+        Returns:
+            Normalized header title, or empty string if not a header
+        """
+        # Match markdown headers: 1-4 # followed by whitespace and title
+        match = re.match(r'^(#{1,4})\s+(.*\S)\s*$', line)
+        if match:
+            title = match.group(2)
+            return self._normalize_text(title)
+        return ''
+
+    def _is_pipe_candidate(self, line: str) -> bool:
+        """
+        Determine if a line is a candidate for being a running header/footer
+        with pipe character.
+
+        Args:
+            line: Line to check
+
+        Returns:
+            True if line appears to be a running header/footer with pipe
+        """
+        if '|' not in line:
+            return False
+
+        # Check for common header/footer patterns:
+        # 1. Begins with digits then pipe: "2 | Chapter 1"
+        if re.match(r'^\s*\d+\s*\|', line):
+            return True
+
+        # 2. Ends with pipe then digits: "Chapter 1 | 13"
+        if re.search(r'\|\s*\d+\s*$', line):
+            return True
+
+        # 3. Contains "chapter" or "section" (case-insensitive)
+        if re.search(r'\b(chapter|section)\b', line, re.IGNORECASE):
+            return True
+
+        return False
+
+    def _matches_seen_header(
+        self, candidate_line: str, headers_seen: Set[str]
+    ) -> bool:
+        """
+        Check if a candidate line matches any previously seen header.
+
+        Args:
+            candidate_line: Line containing pipe character to check
+            headers_seen: Set of normalized header titles seen so far
+
+        Returns:
+            True if any part of the candidate line matches a seen header
+        """
+        if not headers_seen:
+            return False
+
+        # Split on pipe character
+        parts = candidate_line.split('|')
+
+        # Minimum length for substring matching
+        # (to avoid tiny accidental matches)
+        MIN_MATCH_LENGTH = 10
+
+        for part in parts:
+            # Strip leading/trailing digits and whitespace
+            # Remove leading digits: " 13" or "2 "
+            part_cleaned = re.sub(r'^\s*\d+\s*', '', part)
+            part_cleaned = re.sub(r'\s*\d+\s*$', '', part_cleaned)
+            part_cleaned = part_cleaned.strip()
+
+            if not part_cleaned:
+                continue
+
+            # Normalize the part
+            normalized_part = self._normalize_text(part_cleaned)
+
+            # Check for exact match
+            if normalized_part in headers_seen:
+                return True
+
+            # Check for substantial substring match (either direction)
+            # Only if both strings are long enough to avoid false positives
+            if len(normalized_part) >= MIN_MATCH_LENGTH:
+                for seen_header in headers_seen:
+                    if len(seen_header) >= MIN_MATCH_LENGTH:
+                        # Check if normalized_part is substring of seen_header
+                        if normalized_part in seen_header:
+                            return True
+                        # Check if seen_header is substring of normalized_part
+                        if seen_header in normalized_part:
+                            return True
+
+        return False
+
+    def _remove_repeated_pipe_headers(self, markdown_text: str) -> str:
+        """
+        Remove running headers/footers that repeat chapter/section headers
+        when the line contains a pipe character.
+
+        Only removes subsequent mentions (headers/footers that repeat later).
+        Keeps the first mention: the actual markdown header line.
+
+        Args:
+            markdown_text: Markdown text to process
+
+        Returns:
+            Markdown text with repeated pipe headers removed
+        """
+        lines = markdown_text.split('\n')
+        kept_lines = []
+        headers_seen: Set[str] = set()
+
+        for line in lines:
+            # Check if this is a markdown header line
+            header_title = self._extract_header_title(line)
+            if header_title:
+                # Keep markdown headers and add to seen set
+                kept_lines.append(line)
+                headers_seen.add(header_title)
+            else:
+                # Not a markdown header - check if it's a pipe candidate
+                if self._is_pipe_candidate(line):
+                    # Check if it matches a previously seen header
+                    if self._matches_seen_header(line, headers_seen):
+                        # Skip this line (it's a repeated header/footer)
+                        continue
+                # Keep the line (either not a candidate or doesn't match)
+                kept_lines.append(line)
+
+        return '\n'.join(kept_lines)
+
     def extract(self) -> str:
         """
         Extract text from the PDF and return as Markdown-lite string.
@@ -654,6 +812,9 @@ class PDFExtractor:
 
         # Join with double newlines between paragraphs
         markdown_text = '\n\n'.join(markdown_parts)
+
+        # Remove repeated pipe headers/footers
+        markdown_text = self._remove_repeated_pipe_headers(markdown_text)
 
         return markdown_text
 
