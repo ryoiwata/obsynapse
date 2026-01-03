@@ -37,8 +37,6 @@ class PDFExtractor:
         """
         self.pdf_path = pdf_path
         self.doc = fitz.open(pdf_path)
-        self.known_titles = set()
-        self.seen_titles = set()
 
     def _is_monospaced_font(self, font_name: str) -> bool:
         """
@@ -453,92 +451,6 @@ class PDFExtractor:
 
         return 0
 
-    def _is_running_header(
-        self, text: str, paragraph: List[Dict] = None
-    ) -> bool:
-        """
-        Check if a text is a running header/footer.
-
-        Running headers can be:
-        1. Pipe patterns: "Chapter 1: Introduction | 15" or "2 | Chapter 1"
-        2. Known titles that appear standalone (not as actual headers)
-        3. Page numbers alone
-        4. Text in header/footer regions that matches known titles
-
-        Args:
-            text: The text to check
-            paragraph: Optional paragraph blocks for position-based detection
-
-        Returns:
-            True if the text is a running header, False otherwise
-        """
-        text_stripped = text.strip()
-
-        # Check if it's just a page number (standalone digits)
-        if text_stripped.isdigit():
-            return True
-
-        # Check for pipe patterns with advanced normalization
-        if '|' in text:
-            parts = [p.strip() for p in text.split('|')]
-            if len(parts) >= 2:
-                normalized_parts = [
-                    self._normalize_for_comparison(p) for p in parts
-                ]
-
-                for i, norm_p in enumerate(normalized_parts):
-                    # Check if this part matches a known title (fuzzy)
-                    is_title = any(
-                        norm_p == self._normalize_for_comparison(t)
-                        for t in self.known_titles
-                    )
-                    # Check if the OTHER part is just a number
-                    other_part_is_num = parts[1 - i].strip().isdigit()
-
-                    if is_title and other_part_is_num:
-                        return True
-
-                # Also check if both parts are just digits (page numbers)
-                if all(p.strip().isdigit() for p in parts):
-                    return True
-
-        # Check if text is in header/footer region and matches known title
-        # (using normalized comparison)
-        if paragraph:
-            is_header_footer = any(
-                block.get('is_header_footer', False) for block in paragraph
-            )
-            if is_header_footer:
-                # Check if it matches a known title (normalized)
-                text_normalized = self._normalize_for_comparison(text_stripped)
-                for title in self.known_titles:
-                    if text_normalized == self._normalize_for_comparison(
-                        title
-                    ):
-                        return True
-
-        # Check if text matches a known title (normalized comparison)
-        # (but not if it's an actual header)
-        # This catches running headers that appear in the middle of content
-        text_normalized = self._normalize_for_comparison(text_stripped)
-        for title in self.known_titles:
-            if text_normalized == self._normalize_for_comparison(title):
-                # If it's in header/footer region, it's definitely
-                # running header
-                if paragraph and any(
-                    block.get('is_header_footer', False)
-                    for block in paragraph
-                ):
-                    return True
-                # If it's a short standalone text that matches a known title,
-                # it's likely a running header
-                # (actual headers are detected separately)
-                # We'll be conservative and only mark it if it's very short
-                if len(text_stripped.split()) <= 20:
-                    return True
-
-        return False
-
     def _is_header_paragraph(
         self, paragraph: List[Dict], baseline_font_size: float,
         prev_paragraph: List[Dict] = None
@@ -559,20 +471,10 @@ class PDFExtractor:
         if not paragraph:
             return False, 0
 
-        # Extract text for running header check
-        paragraph_text = ' '.join(
-            block['text'] for block in paragraph
-        ).strip()
-
-        # Simple check: if it contains pipe and digit, it's likely a running
-        # header (we don't have known_titles here, so use simple heuristic)
-        if '|' in paragraph_text:
-            parts = [p.strip() for p in paragraph_text.split('|')]
-            if any(part.isdigit() for part in parts):
-                return False, 0
-
         # Extract full text of the paragraph
-        paragraph_text = ' '.join(block['text'] for block in paragraph).strip()
+        paragraph_text = ' '.join(
+            block.get('text', '') for block in paragraph
+        ).strip()
 
         # Exclude table and figure captions from being treated as headers
         # Check if text starts with common caption labels (case-insensitive)
@@ -675,730 +577,7 @@ class PDFExtractor:
                 is_header = False
                 header_level = 0
 
-        # If this is a header, add original text to known_titles
-        # for fuzzy matching of running headers (we normalize when comparing)
-        if is_header and paragraph_text:
-            self.known_titles.add(paragraph_text.strip())
-
         return is_header, header_level
-
-    def _strip_running_header(self, text: str) -> str:
-        """
-        Strip running header from the beginning of text if present.
-
-        Checks if text starts with a known title followed by optional
-        pipe and page number, and removes that portion.
-
-        Args:
-            text: Text that may start with a running header
-
-        Returns:
-            Text with running header stripped from the beginning, or
-            original text if no running header found
-        """
-        cleaned_text = text.strip()
-
-        # Check for known titles at the start of the merged block
-        for title in self.known_titles:
-            if cleaned_text.lower().startswith(title.lower()):
-                # Remove the title
-                remaining = cleaned_text[len(title):].strip()
-
-                # Also remove a leading pipe or page number if they exist
-                # e.g., "| 14 " or " 14 " or "|14"
-                # Regex to catch: optional pipe, then numbers, then optional
-                # trailing space/pipe
-                remaining = re.sub(r'^[\s|]*\d+[\s|]*', '', remaining).strip()
-
-                return remaining
-
-        return cleaned_text
-
-    def _remove_running_header_from_text(self, text: str) -> str:
-        """
-        Remove running header portion from text if it contains one.
-
-        Removes:
-        1. Pipe patterns with digits and known titles
-        2. Standalone occurrences of known titles anywhere in the text
-        3. Page numbers (standalone digits)
-        4. Combinations like "Chapter 1 | 15" or "15 | Chapter 1"
-
-        Args:
-            text: Text that may contain a running header
-
-        Returns:
-            Text with running header removed, or original text if no
-            running header found
-        """
-        if not text or not text.strip():
-            return text
-
-        text = text.strip()
-
-        # First, handle pipe patterns using normalized comparison
-        if '|' in text:
-            parts = [p.strip() for p in text.split('|')]
-            if len(parts) >= 2:
-                cleaned_parts = []
-                for part in parts:
-                    part_stripped = part.strip()
-                    # Skip if it's just a digit (page number)
-                    if part_stripped.isdigit():
-                        continue
-                    # Skip if it matches a known title (using normalized comparison)
-                    part_normalized = self._normalize_for_comparison(part_stripped)
-                    is_title = any(
-                        part_normalized == self._normalize_for_comparison(t)
-                        for t in self.known_titles
-                    )
-                    if is_title:
-                        continue
-                    # Otherwise, keep it
-                    cleaned_parts.append(part)
-
-                # If we removed parts, reconstruct
-                if len(cleaned_parts) < len(parts):
-                    result = ' '.join(cleaned_parts).strip()
-                    if result:
-                        text = result
-                    else:
-                        return ''  # Entire text was a running header
-
-        # Now check for standalone known titles anywhere in the text
-        # In merged content, any occurrence of a known title is likely
-        # a running header (the actual header would have been processed
-        # separately)
-        text_lower = text.lower()
-
-        # Check each known title
-        for title in self.known_titles:
-            title_lower = title.lower()
-
-            # Find all occurrences of this title in the text
-            # Use word boundaries to avoid partial matches
-            pattern = r'\b' + re.escape(title_lower) + r'\b'
-            matches = list(re.finditer(pattern, text_lower))
-
-            # Process matches from end to start to preserve indices
-            for match in reversed(matches):
-                start, end = match.span()
-                before = text[:start].rstrip()
-                after = text[end:].lstrip()
-
-                # Check if this occurrence is a running header
-                # It's a running header if:
-                # 1. It's at a sentence boundary
-                #    (after . ! ? or before sentence start)
-                # 2. It's at the start/end of the text
-                # 3. It's surrounded by whitespace and appears isolated
-
-                is_at_sentence_end = (
-                    not before or
-                    before.endswith(('.', '!', '?', ':', ';'))
-                )
-                is_at_sentence_start = (
-                    not after or
-                    after[0] in '.!?'
-                )
-                is_at_text_boundary = (start == 0 or end == len(text))
-
-                # Check if it's isolated
-                # (surrounded by sentence boundaries or whitespace)
-                is_isolated = (
-                    is_at_sentence_end and
-                    (is_at_sentence_start or is_at_text_boundary)
-                )
-
-                # Also check if there's significant content before and after
-                # (if there is, it might be part of a sentence, not a
-                # running header)
-                has_content_before = (
-                    len(before.split()) > 0 if before else False
-                )
-                has_content_after = (
-                    len(after.split()) > 0 if after else False
-                )
-
-                # If it's isolated and either at a boundary or between
-                # sentences, it's likely a running header
-                if (is_isolated or
-                        (is_at_text_boundary and len(text.split()) <= 30)):
-                    # Additional check: if it's in the middle with content
-                    # on both sides, only remove if it's clearly separated
-                    # (sentence boundaries)
-                    if has_content_before and has_content_after:
-                        if not (is_at_sentence_end and is_at_sentence_start):
-                            continue  # Probably part of content, skip
-
-                    # Remove the title and clean up spacing
-                    text = before + (' ' if before and after else '') + after
-                    text = text.strip()
-
-        # Remove standalone page numbers (just digits) but be conservative
-        # Only remove if they're clearly page numbers
-        # (1-3 digits, standalone)
-        # Pattern: standalone digits at boundaries or with pipes
-        # Match: start of text + digits + end, or
-        # space/pipe + digits + space/pipe/end
-        text = re.sub(
-            r'(?:^|[\s|])(\d{1,3})(?:[\s|]|$)',
-            lambda m: ' ' if m.group(1) else m.group(0),
-            text
-        )
-        # Clean up multiple spaces
-        text = re.sub(r'\s+', ' ', text).strip()
-
-        return text if text else ''
-
-    def _remove_running_headers(self, text: str) -> str:
-        """
-        Remove running headers from text by checking against known titles.
-
-        This method checks if the text starts with or contains any string
-        from self.known_titles. If a match is found, it removes the title,
-        any associated pipe |, and any adjacent page numbers.
-
-        Args:
-            text: Text that may contain running headers
-
-        Returns:
-            Text with running headers removed
-        """
-        cleaned = text.strip()
-        if not cleaned or not self.known_titles:
-            return cleaned
-
-        # Sort titles by length descending to catch longest matches first
-        for title in sorted(self.known_titles, key=len, reverse=True):
-            # Pattern to catch: Title, optional pipe, optional page number,
-            # and surrounding whitespace
-            # Example matches: "Chapter 1 | 14", "14 | Chapter 1",
-            # "Chapter 1 Figure..."
-            pattern = re.compile(
-                rf"({re.escape(title)})|"
-                rf"(\b\d+\b\s*\|\s*{re.escape(title)})|"
-                rf"({re.escape(title)}\s*\|\s*\b\d+\b)",
-                re.IGNORECASE
-            )
-            if pattern.search(cleaned):
-                cleaned = pattern.sub("", cleaned).strip()
-
-        # Clean up leftover leading pipes or orphan numbers at start/end
-        cleaned = re.sub(r"^[|\s\d]+|[|\s\d]+$", "", cleaned).strip()
-        return cleaned
-
-    def _strip_merged_header(self, text: str) -> str:
-        """
-        Strip a known header from the beginning of text if present.
-
-        If the text starts with a known title, strips the header prefix
-        (including any associated pipe | and page numbers) but keeps
-        any substantive content that follows.
-
-        Handles patterns like:
-        - "14 | Chapter 1: Introduction..." -> "Figure 1-6..."
-        - "Chapter 1: Introduction | 14 Figure..." -> "Figure..."
-        - "Chapter 1: Introduction Figure..." -> "Figure..."
-
-        Uses normalized comparison to match titles, ignoring punctuation.
-
-        Args:
-            text: Text that may start with a running header
-
-        Returns:
-            Text with header prefix stripped, or original text if no header
-            found at the start
-        """
-        if not text or not self.known_titles:
-            return text
-
-        text_stripped = text.strip()
-        if not text_stripped:
-            return text
-
-        # First, handle pipe patterns at the start:
-        # "14 | Title..." or "Title | 14 ..."
-        if '|' in text_stripped:
-            # Split by first pipe only
-            pipe_pos = text_stripped.find('|')
-            if pipe_pos != -1:
-                before_pipe = text_stripped[:pipe_pos].strip()
-                after_pipe = text_stripped[pipe_pos + 1:].strip()
-
-                # Pattern 1: "14 | Title..."
-                if before_pipe.isdigit():
-                    # Check if after_pipe starts with known title (normalized)
-                    for title in sorted(
-                        self.known_titles, key=len, reverse=True
-                    ):
-                        after_norm = self._normalize_for_comparison(after_pipe)
-                        title_norm = self._normalize_for_comparison(title)
-
-                        if after_norm.startswith(title_norm):
-                            # Find where title ends in after_pipe
-                            words = after_pipe.split()
-                            title_words = title.split()
-
-                            # Try to find matching prefix
-                            max_n = min(len(words), len(title_words) + 10)
-                            for n in range(max_n, 0, -1):
-                                candidate = ' '.join(words[:n])
-                                cand_norm = self._normalize_for_comparison(
-                                    candidate
-                                )
-                                if cand_norm == title_norm:
-                                    # Found match - return remaining words
-                                    remaining = ' '.join(words[n:]).strip()
-                                    # Remove any leading page numbers
-                                    remaining = re.sub(
-                                        r'^[\s|]*\d+[\s|]*', '', remaining
-                                    ).strip()
-                                    if remaining:
-                                        return remaining
-                                    break
-
-                # Pattern 2: "Title | 14 ..."
-                # Check if before_pipe starts with known title
-                # and after_pipe starts with a number
-                if after_pipe:
-                    after_words = after_pipe.split()
-                    if after_words and after_words[0].isdigit():
-                        for title in sorted(
-                            self.known_titles, key=len, reverse=True
-                        ):
-                            before_norm = self._normalize_for_comparison(
-                                before_pipe
-                            )
-                            title_norm = self._normalize_for_comparison(title)
-
-                            if before_norm.startswith(title_norm):
-                                # Find where title ends in before_pipe
-                                words = before_pipe.split()
-                                title_words = title.split()
-
-                                max_n = min(len(words), len(title_words) + 10)
-                                for n in range(max_n, 0, -1):
-                                    candidate = ' '.join(words[:n])
-                                    cand_norm = self._normalize_for_comparison(
-                                        candidate
-                                    )
-                                    if cand_norm == title_norm:
-                                        # Title matches - remove pipe pattern
-                                        # Return what comes after pipe/number
-                                        after_clean = re.sub(
-                                            r'^\d+[\s|]*', '', after_pipe
-                                        ).strip()
-                                        if after_clean:
-                                            return after_clean
-                                        break
-
-        # Handle non-pipe patterns: text starting with a known title
-        # Sort titles by length descending to catch longest matches first
-        text_normalized = self._normalize_for_comparison(text_stripped)
-        for title in sorted(self.known_titles, key=len, reverse=True):
-            title_normalized = self._normalize_for_comparison(title)
-
-            if text_normalized.startswith(title_normalized):
-                # Find where the title actually ends in the original text
-                words = text_stripped.split()
-                title_words = title.split()
-
-                # Try to find the longest matching prefix
-                max_n = min(len(words), len(title_words) + 10)
-                for n in range(max_n, 0, -1):
-                    candidate = ' '.join(words[:n])
-                    if (self._normalize_for_comparison(candidate) ==
-                            title_normalized):
-                        # Found exact match - remove these words
-                        remaining = ' '.join(words[n:]).strip()
-                        # Also remove any leading pipe or page numbers
-                        remaining = re.sub(
-                            r'^[\s|]*\d+[\s|]*', '', remaining
-                        ).strip()
-                        if remaining and len(remaining.split()) > 0:
-                            return remaining
-                        break
-
-        return text
-
-    def _clean_paragraph_text(self, text: str) -> str:
-        """
-        Clean paragraph text by removing duplicate headers.
-
-        Removes:
-        1. Exact matches of seen titles (standalone duplicates) using normalized comparison
-        2. Merged headers at the start of paragraphs (including pipe patterns)
-
-        Args:
-            text: Text that may contain duplicate headers
-
-        Returns:
-            Cleaned text, or empty string if entire text was a duplicate
-        """
-        if not text or not text.strip():
-            return text.strip()
-
-        text_stripped = text.strip()
-
-        # 1. Check for exact matches (standalone duplicates) using normalized comparison
-        text_normalized = self._normalize_for_comparison(text_stripped)
-        for seen_title in self.seen_titles:
-            seen_normalized = self._normalize_for_comparison(seen_title)
-            if text_normalized == seen_normalized:
-                return ""
-
-        # 2. Use _strip_merged_header to remove merged headers at start
-        # This handles both pipe patterns and direct title matches
-        cleaned = self._strip_merged_header(text_stripped)
-
-        # If _strip_merged_header found and removed a header, return cleaned
-        if cleaned != text_stripped:
-            return cleaned.strip()
-
-        # 3. Fallback: Check for merged headers using normalized comparison
-        # Sort titles by length descending to avoid partial matches
-        sorted_titles = sorted(self.seen_titles, key=len, reverse=True)
-        for title in sorted_titles:
-            # Use normalized comparison to match titles
-            title_normalized = self._normalize_for_comparison(title)
-            if text_normalized.startswith(title_normalized):
-                # Find where title ends and remove it
-                words = text_stripped.split()
-                title_words = title.split()
-                max_n = min(len(words), len(title_words) + 10)
-                for n in range(max_n, 0, -1):
-                    candidate = ' '.join(words[:n])
-                    if (self._normalize_for_comparison(candidate) ==
-                            title_normalized):
-                        remaining = ' '.join(words[n:]).strip()
-                        # Remove any leading pipe or page numbers
-                        remaining = re.sub(
-                            r'^[\s|]*\d+[\s|]*', '', remaining
-                        ).strip()
-                        if remaining:
-                            return remaining
-                        break
-
-        return text_stripped
-
-    def _is_numeric_prefix_line(self, text: str) -> bool:
-        """
-        Check if text matches the strict numeric prefix pattern.
-
-        Matches lines that start with one or more digits, followed by whitespace,
-        followed by any non-empty text (e.g., "2 For non-English languages...").
-
-        This method does NOT match numbered list items (e.g., "1. Step one")
-        by ensuring there is NO period directly after the number.
-
-        Args:
-            text: The text to check
-
-        Returns:
-            True if the text matches the numeric prefix pattern, False otherwise
-
-        Examples:
-            >>> _is_numeric_prefix_line("2 For non-English languages...")
-            True
-            >>> _is_numeric_prefix_line("3 Autoregressive language models...")
-            True
-            >>> _is_numeric_prefix_line("1. Step one")
-            False
-            >>> _is_numeric_prefix_line("14 Chapter title continues...")
-            True
-        """
-        if not text or not text.strip():
-            return False
-
-        text_stripped = text.strip()
-
-        # Pattern: starts with digit(s), whitespace, then any non-whitespace char
-        # This matches: "2 For non-English...", "3 Autoregressive...", etc.
-        numeric_prefix_pattern = re.compile(r"^\d+\s+\S")
-        if not numeric_prefix_pattern.match(text_stripped):
-            return False
-
-        # Crucial: exclude numbered list items by checking for period after number
-        # Pattern: digit(s) followed by period and space (e.g., "1. Step one")
-        numbered_list_pattern = re.compile(r"^\d+\.\s+")
-        if numbered_list_pattern.match(text_stripped):
-            return False
-
-        return True
-
-    def _split_paragraph_into_lines(self, paragraph: List[Dict]) -> List[List[Dict]]:
-        """
-        Split a paragraph into visual lines based on Y-coordinate tolerance.
-
-        Groups blocks within a paragraph into lines using the same LINE_TOLERANCE
-        concept from _sort_blocks_by_position. This allows line-level filtering
-        of numeric prefix footnotes without removing entire paragraphs.
-
-            Args:
-            paragraph: List of text block dictionaries representing a paragraph
-
-            Returns:
-            List of lines, where each line is a list of blocks
-        """
-        if not paragraph:
-            return []
-
-        # Tolerance for grouping blocks into the same line (in pixels)
-        # Reuse the same value from _sort_blocks_by_position
-        LINE_TOLERANCE = 3.0
-
-        # Sort blocks by Y-coordinate
-        blocks_sorted_by_y = sorted(paragraph, key=lambda b: b.get('y_pos', 0))
-
-        # Group blocks into lines based on Y-coordinate tolerance
-        lines = []
-        current_line = []
-        current_line_y = None
-
-        for block in blocks_sorted_by_y:
-            block_y = block.get('y_pos', 0)
-
-            # If this is the first block or Y is within tolerance, add to current line
-            if (current_line_y is None or
-                    abs(block_y - current_line_y) <= LINE_TOLERANCE):
-                current_line.append(block)
-                if current_line_y is None:
-                    current_line_y = block_y
-                else:
-                    current_line_y = min(current_line_y, block_y)
-            else:
-                # Y difference exceeds tolerance, start a new line
-                if current_line:
-                    # Sort current line by X-coordinate (left to right)
-                    current_line.sort(key=lambda b: b.get('bbox', [0, 0, 0, 0])[0])
-                    lines.append(current_line)
-                current_line = [block]
-                current_line_y = block_y
-
-        # Don't forget the last line
-        if current_line:
-            current_line.sort(key=lambda b: b.get('bbox', [0, 0, 0, 0])[0])
-            lines.append(current_line)
-
-        return lines
-
-    def _line_text(self, line: List[Dict]) -> str:
-        """Get combined text from a line of blocks."""
-        return ' '.join(block.get('text', '') for block in line).strip()
-
-    def _line_y(self, line: List[Dict]) -> float:
-        """Get minimum Y position from a line of blocks."""
-        if not line:
-            return 0.0
-        return min(block.get('y_pos', 0.0) for block in line)
-
-    def _line_font_size(self, line: List[Dict]) -> float:
-        """Get average font size from a line of blocks."""
-        if not line:
-            return 0.0
-        sizes = [
-            block.get('font_size', 0.0) for block in line
-            if block.get('font_size', 0.0) > 0
-        ]
-        if not sizes:
-            return 0.0
-        return sum(sizes) / len(sizes)
-
-    def _line_left_x(self, line: List[Dict]) -> float:
-        """Get minimum left X position from a line of blocks."""
-        if not line:
-            return 0.0
-        return min(block.get('bbox', [0, 0, 0, 0])[0] for block in line)
-
-    def _filter_numeric_prefix_footnote_blocks(
-        self, lines: List[List[Dict]], baseline_font_size: float
-    ) -> List[List[Dict]]:
-        """
-        Filter out numeric prefix footnote blocks, including continuation lines.
-
-        When a line matches the numeric prefix pattern, it's treated as the start
-        of a footnote block. All subsequent continuation lines are removed until
-        a stop condition is met (blank line, header, indentation shift, etc.).
-
-        Args:
-            lines: List of lines, where each line is a list of blocks
-            baseline_font_size: Baseline font size for the document
-
-        Returns:
-            List of lines with numeric prefix footnote blocks removed
-
-        Example:
-            Input:
-            - "7 In school, ..."
-            - "we generally use model weights ..."
-            - "8 It seems counterintuitive ..."
-            - "shouldn't it require fewer examples ..."
-
-            Output: [] (all removed as footnote blocks)
-        """
-        if not lines:
-            return []
-
-        filtered_lines = []
-        in_footnote_block = False
-        footnote_start_x = None
-        footnote_font_size = None
-        prev_line_y = None
-        X_THRESHOLD = 30.0  # Pixels for indentation shift detection
-
-        for i, line in enumerate(lines):
-            line_text = self._line_text(line)
-            line_y = self._line_y(line)
-            line_font_size = self._line_font_size(line)
-            line_left_x = self._line_left_x(line)
-
-            # Check if this line starts a new footnote block
-            is_numeric_prefix = self._is_numeric_prefix_line(line_text)
-
-            if is_numeric_prefix:
-                # Start of a new footnote block
-                in_footnote_block = True
-                footnote_start_x = line_left_x
-                footnote_font_size = line_font_size
-                # Drop this line
-                prev_line_y = line_y
-                continue
-
-            if in_footnote_block:
-                # We're in a footnote block - check stop conditions
-
-                # Stop condition 1: Blank line
-                if not line_text:
-                    in_footnote_block = False
-                    # Don't keep blank line
-                    prev_line_y = line_y
-                    continue
-
-                # Stop condition 2: Numbered list item
-                numbered_list_pattern = re.compile(r"^\d+\.\s+")
-                if numbered_list_pattern.match(line_text):
-                    in_footnote_block = False
-                    filtered_lines.append(line)
-                    prev_line_y = line_y
-                    continue
-
-                # Stop condition 3: Header-like line (significantly
-                # larger font)
-                if (baseline_font_size > 0 and
-                        line_font_size >= baseline_font_size * 1.2):
-                    in_footnote_block = False
-                    filtered_lines.append(line)
-                    prev_line_y = line_y
-                    continue
-
-                # Stop condition 4: New paragraph indentation /
-                # left margin shift
-                if footnote_start_x is not None:
-                    x_diff = abs(line_left_x - footnote_start_x)
-                    if x_diff > X_THRESHOLD:
-                        in_footnote_block = False
-                        filtered_lines.append(line)
-                        prev_line_y = line_y
-                        continue
-
-                # Stop condition 5: Large vertical gap
-                if prev_line_y is not None and baseline_font_size > 0:
-                    y_diff = line_y - prev_line_y
-                    if y_diff > (baseline_font_size * 2.0):
-                        in_footnote_block = False
-                        filtered_lines.append(line)
-                        prev_line_y = line_y
-                        continue
-
-                # Continuation heuristic: if font size is close to baseline
-                # and left_x is close to footnote_start_x, assume continuation
-                is_continuation = False
-                if (footnote_start_x is not None and
-                        footnote_font_size is not None):
-                    x_close = (
-                        abs(line_left_x - footnote_start_x) <= X_THRESHOLD
-                    )
-                    font_similar = (
-                        baseline_font_size > 0 and
-                        line_font_size <= baseline_font_size * 1.1
-                    )
-                    if x_close and font_similar:
-                        is_continuation = True
-
-                if is_continuation:
-                    # Drop this continuation line
-                    prev_line_y = line_y
-                    continue
-                else:
-                    # Doesn't look like continuation - end footnote block
-                    in_footnote_block = False
-                    filtered_lines.append(line)
-                    prev_line_y = line_y
-            else:
-                # Not in a footnote block - keep the line
-                filtered_lines.append(line)
-                prev_line_y = line_y
-
-        return filtered_lines
-
-    def _clean_footnotes(self, text: str) -> str:
-        """
-        Strict final pass to remove numeric prefix footnote blocks.
-
-        Removes entire paragraphs that start with a numeric prefix line,
-        including all continuation lines. This ensures any leftover
-        continuation lines get removed even if earlier logic misses them.
-
-        Args:
-            text: Markdown text that may contain numeric prefix blocks
-
-        Returns:
-            Text with numeric prefix footnote blocks removed and normalized
-        """
-        if not text:
-            return text
-
-        # Split markdown into paragraphs by blank lines (double newlines)
-        paragraphs = re.split(r'\n\n+', text)
-        cleaned_paragraphs = []
-        removed_count = 0
-
-        for para in paragraphs:
-            # Find the first non-empty line in the paragraph
-            lines = para.split('\n')
-            first_non_empty_line = None
-            for line in lines:
-                line_stripped = line.strip()
-                if line_stripped:
-                    first_non_empty_line = line_stripped
-                    break
-
-            # If the first non-empty line matches numeric prefix
-            # (excluding numbered lists), drop the entire paragraph
-            if first_non_empty_line:
-                # Check for numbered list pattern first
-                numbered_list_pattern = re.compile(r"^\d+\.\s+")
-                if numbered_list_pattern.match(first_non_empty_line):
-                    # Keep numbered lists
-                    cleaned_paragraphs.append(para)
-                elif self._is_numeric_prefix_line(first_non_empty_line):
-                    # Drop entire paragraph (footnote block)
-                    removed_count += 1
-                else:
-                    # Keep regular paragraphs
-                    cleaned_paragraphs.append(para)
-            else:
-                # Empty paragraph - keep it (will be normalized later)
-                cleaned_paragraphs.append(para)
-
-        # Join paragraphs back with double newlines
-        cleaned_text = '\n\n'.join(cleaned_paragraphs)
-
-        # Normalize excessive blank lines (3+ newlines -> 2 newlines)
-        cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
-
-        return cleaned_text
 
     def _paragraphs_to_markdown(
         self, paragraphs: List[List[Dict]], all_blocks: List[Dict] = None
@@ -1431,57 +610,23 @@ class PDFExtractor:
         current_code_block = []
         in_code_block = False
 
-        # Track numeric footnotes removed for logging
-        numeric_footnote_count = 0
-
         prev_paragraph = None
         for paragraph in paragraphs:
-            # Split paragraph into visual lines for line-level filtering
-            # This allows us to remove numeric prefix footnote lines without
-            # deleting entire paragraphs that contain real content
-            lines = self._split_paragraph_into_lines(paragraph)
-
-            # Filter out numeric prefix footnote blocks (including continuation lines)
-            filtered_lines = self._filter_numeric_prefix_footnote_blocks(
-                lines, baseline_font_size
-            )
-            removed_count = len(lines) - len(filtered_lines)
-            if removed_count > 0:
-                numeric_footnote_count += removed_count
-
-            # If all lines were removed, skip this paragraph
-            if not filtered_lines:
-                continue
-
-            # Reconstruct paragraph from remaining lines
-            # Join blocks within each line, then join lines with spaces
-            paragraph_blocks = []
-            for line in filtered_lines:
-                paragraph_blocks.extend(line)
-
-            # If no blocks remain after filtering, skip
-            if not paragraph_blocks:
-                continue
-
-            # Extract paragraph text from filtered blocks
+            # Extract paragraph text
             paragraph_text = ' '.join(
-                block.get('text', '') for block in paragraph_blocks
+                block.get('text', '') for block in paragraph
             ).strip()
 
+            # Skip if empty
             if not paragraph_text:
                 continue
 
-            # Update paragraph to use filtered blocks for subsequent processing
-            paragraph = paragraph_blocks
-
             # Check if paragraph contains monospaced text
             paragraph_is_monospaced = any(
-                block['is_monospaced'] for block in paragraph
+                block.get('is_monospaced', False) for block in paragraph
             )
 
             # Check if paragraph is a header (but not if it's monospaced)
-            # This check happens BEFORE removing running headers to ensure
-            # we can identify the first occurrence
             is_header = False
             header_level = 0
             if not paragraph_is_monospaced:
@@ -1498,7 +643,7 @@ class PDFExtractor:
 
                 # Add all text from paragraph to code block
                 paragraph_text = ' '.join(
-                    block['text'] for block in paragraph
+                    block.get('text', '') for block in paragraph
                 )
                 current_code_block.append(paragraph_text)
             else:
@@ -1510,58 +655,15 @@ class PDFExtractor:
                     in_code_block = False
 
                 if paragraph_text:
-                    # Case A: Standalone Header
+                    # Emit header or regular paragraph
                     if is_header:
-                        # This is a structural header
-                        # Use normalized comparison for seen_titles check
-                        normalized_title = self._normalize_for_comparison(
-                            paragraph_text
+                        header_prefix = '#' * header_level
+                        markdown_parts.append(
+                            f'{header_prefix} {paragraph_text}'
                         )
-                        # Check if we've seen this normalized title before
-                        seen_before = any(
-                            normalized_title ==
-                            self._normalize_for_comparison(seen)
-                            for seen in self.seen_titles
-                        )
-                        if seen_before:
-                            # Already seen - skip duplicate standalone header
-                            continue
-                        else:
-                            # First occurrence - add original text to
-                            # seen_titles and keep it
-                            self.seen_titles.add(paragraph_text.strip())
-                            # Normalized version already added to known_titles
-                            # in _is_header_paragraph
-                            header_prefix = '#' * header_level
-                            markdown_parts.append(
-                                f'{header_prefix} {paragraph_text}'
-                            )
                     else:
-                        # Case B: Not a standalone header - check for merged
-                        # headers at the start
-                        # Use _strip_merged_header first to handle pipe patterns
-                        # This will strip headers while preserving content after
-                        paragraph_text = self._strip_merged_header(
-                            paragraph_text
-                        )
-
-                        # If entire paragraph was stripped, skip it
-                        if not paragraph_text or not paragraph_text.strip():
-                            continue
-
-                        # Clean merged headers at start (handles extra cases)
-                        cleaned_text = self._clean_paragraph_text(paragraph_text)
-
-                        # Skip if paragraph is empty after cleaning
-                        if not cleaned_text:
-                            continue
-
-                        # Skip if it's clearly a running header
-                        if self._is_running_header(cleaned_text, paragraph):
-                            continue
-
-                        # Add regular paragraph
-                        markdown_parts.append(cleaned_text)
+                        # Add regular paragraph as-is
+                        markdown_parts.append(paragraph_text)
 
             # Update previous paragraph for spacing checks
             prev_paragraph = paragraph
@@ -1570,14 +672,6 @@ class PDFExtractor:
         if in_code_block:
             code_text = '\n'.join(current_code_block)
             markdown_parts.append(f'```\n{code_text}\n```')
-
-        # Log numeric footnotes removed
-        if numeric_footnote_count > 0:
-            logger = logging.getLogger(__name__)
-            logger.info(
-                f"Removed {numeric_footnote_count} numeric footnote "
-                f"paragraph(s) during markdown conversion"
-            )
 
         return markdown_parts
 
@@ -1629,10 +723,6 @@ class PDFExtractor:
         # Merge paragraphs across page boundaries where appropriate
         merged_paragraphs = self._merge_pages_paragraphs(page_paragraphs)
 
-        # Note: We no longer do a first pass to build known_titles.
-        # Instead, we use first-seen logic in _paragraphs_to_markdown
-        # to preserve the first occurrence of each header.
-
         # Convert all merged paragraphs to markdown
         # Pass all_blocks for baseline font size calculation
         markdown_parts = self._paragraphs_to_markdown(
@@ -1641,9 +731,6 @@ class PDFExtractor:
 
         # Join with double newlines between paragraphs
         markdown_text = '\n\n'.join(markdown_parts)
-
-        # Clean footnotes from the final markdown
-        markdown_text = self._clean_footnotes(markdown_text)
 
         return markdown_text
 
@@ -1655,9 +742,6 @@ class PDFExtractor:
 
         Evaluates the last paragraph of each page with the first paragraph
         of the next page to determine if they should be merged.
-
-        Filters out running headers before merging to prevent them from
-        being included in merged content.
 
         Args:
             page_paragraphs: List of pages, where each page is a list of
@@ -1677,65 +761,30 @@ class PDFExtractor:
             next_page_paragraphs = page_paragraphs[page_idx + 1]
 
             # If current page has no paragraphs, just add next page's
-            # paragraphs (after filtering running headers)
+            # paragraphs
             if not current_page_paragraphs:
-                # Filter running headers from next page
-                filtered_next = [
-                    para for para in next_page_paragraphs
-                    if not self._is_running_header(
-                        ' '.join(
-                            block['text'] for block in para
-                        ).strip(),
-                        para
-                    )
-                ]
-                current_page_paragraphs = filtered_next
+                current_page_paragraphs = next_page_paragraphs
                 continue
 
             # If next page has no paragraphs, add current page's paragraphs
-            # (after filtering running headers)
             if not next_page_paragraphs:
-                filtered_current = [
-                    para for para in current_page_paragraphs
-                    if not self._is_running_header(
-                        ' '.join(
-                            block['text'] for block in para
-                        ).strip(),
-                        para
-                    )
-                ]
-                merged.extend(filtered_current)
+                merged.extend(current_page_paragraphs)
                 current_page_paragraphs = []
                 continue
 
-            # Filter running headers from boundaries before merging
             # Get last paragraph of current page
-            # (skip if it's a running header)
-            last_para = None
+            last_para = (
+                current_page_paragraphs[-1]
+                if current_page_paragraphs else None
+            )
             last_para_idx = len(current_page_paragraphs) - 1
-            for i in range(len(current_page_paragraphs) - 1, -1, -1):
-                para = current_page_paragraphs[i]
-                para_text = ' '.join(
-                    block['text'] for block in para
-                ).strip()
-                if not self._is_running_header(para_text, para):
-                    last_para = para
-                    last_para_idx = i
-                    break
 
             # Get first paragraph of next page
-            # (skip if it's a running header)
-            first_para = None
+            first_para = (
+                next_page_paragraphs[0]
+                if next_page_paragraphs else None
+            )
             first_para_idx = 0
-            for i in range(len(next_page_paragraphs)):
-                para = next_page_paragraphs[i]
-                para_text = ' '.join(
-                    block['text'] for block in para
-                ).strip()
-                if not self._is_running_header(para_text, para):
-                    first_para = para
-                    first_para_idx = i
-                    break
 
             # If we found valid paragraphs to potentially merge
             if last_para and first_para:
@@ -1761,63 +810,17 @@ class PDFExtractor:
                     )
                 else:
                     # No merging needed - add all paragraphs from current page
-                    # (including last_para)
-                    merged.extend(
-                        current_page_paragraphs[:last_para_idx + 1]
-                    )
+                    merged.extend(current_page_paragraphs)
                     # Start fresh with next page's paragraphs
-                    # (from first_para onwards)
-                    current_page_paragraphs = (
-                        next_page_paragraphs[first_para_idx:]
-                    )
-            elif last_para:
-                # No valid first para on next page
-                # - add current page's paragraphs
-                merged.extend(current_page_paragraphs[:last_para_idx + 1])
-                current_page_paragraphs = []
-            elif first_para:
-                # No valid last para on current page
-                # - add what we have and move to next
-                merged.extend([
-                    para for para in current_page_paragraphs
-                    if not self._is_running_header(
-                        ' '.join(
-                            block['text'] for block in para
-                        ).strip(),
-                        para
-                    )
-                ])
-                current_page_paragraphs = (
-                    next_page_paragraphs[first_para_idx:]
-                )
+                    current_page_paragraphs = next_page_paragraphs
             else:
-                # Both are running headers - skip both and continue
-                merged.extend([
-                    para for para in current_page_paragraphs[:last_para_idx]
-                    if not self._is_running_header(
-                        ' '.join(
-                            block['text'] for block in para
-                        ).strip(),
-                        para
-                    )
-                ])
-                current_page_paragraphs = (
-                    next_page_paragraphs[first_para_idx + 1:]
-                )
+                # No valid paragraphs to merge - add current and move to next
+                merged.extend(current_page_paragraphs)
+                current_page_paragraphs = next_page_paragraphs
 
         # Add any remaining paragraphs from the last page
-        # (filtering running headers)
         if current_page_paragraphs:
-            filtered_remaining = [
-                para for para in current_page_paragraphs
-                if not self._is_running_header(
-                    ' '.join(
-                        block['text'] for block in para
-                    ).strip(),
-                    para
-                )
-            ]
-            merged.extend(filtered_remaining)
+            merged.extend(current_page_paragraphs)
 
         return merged
 
