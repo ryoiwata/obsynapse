@@ -11,7 +11,6 @@ import argparse
 import logging
 import sys
 import os
-import re
 from datetime import datetime
 
 
@@ -66,12 +65,6 @@ class PDFExtractor:
         text_dict = page.get_text('dict')
         blocks = []
 
-        # Get page dimensions for header/footer detection
-        page_rect = page.rect
-        page_height = page_rect.height
-        header_threshold = page_height * 0.10  # Top 10%
-        footer_threshold = page_height * 0.90  # Bottom 10%
-
         for block in text_dict.get('blocks', []):
             if 'lines' not in block:
                 continue
@@ -82,10 +75,9 @@ class PDFExtractor:
                     if not text:
                         continue
 
-                    # Get position (use bbox for Y-coordinate)
+                    # Get position (bbox Y-coordinate for reading order)
                     bbox = span.get('bbox', [0, 0, 0, 0])
                     y_pos = bbox[1]  # Top Y coordinate
-                    y_bottom = bbox[3]  # Bottom Y coordinate
 
                     # Check if text is bold
                     # PyMuPDF flags: bit 4 (16) indicates bold
@@ -93,13 +85,6 @@ class PDFExtractor:
                     is_bold = (
                         (flags & 16) != 0 or
                         'bold' in span.get('font', '').lower()
-                    )
-
-                    # Determine if block is in header or footer region
-                    is_in_header_region = y_pos <= header_threshold
-                    is_in_footer_region = y_bottom >= footer_threshold
-                    is_header_footer = (
-                        is_in_header_region or is_in_footer_region
                     )
 
                     # Store span info
@@ -112,9 +97,7 @@ class PDFExtractor:
                         'is_monospaced': self._is_monospaced_font(
                             span.get('font', '')
                         ),
-                        'is_bold': is_bold,
-                        'is_header_footer': is_header_footer,
-                        'page_height': page_height
+                        'is_bold': is_bold
                     })
 
         return blocks
@@ -390,66 +373,6 @@ class PDFExtractor:
         # Return the most common font size
         baseline = max(font_size_counts.items(), key=lambda x: x[1])[0]
         return baseline
-
-    def _normalize_for_comparison(self, text: str) -> str:
-        """
-        Normalize text for fuzzy comparison by removing non-alphanumeric
-        characters.
-
-        Converts text to lowercase and removes all non-alphanumeric characters
-        (including colons, dashes, pipes, and extra spaces) for fuzzy matching
-        of headers that may have punctuation differences.
-
-        Args:
-            text: Text to normalize
-
-        Returns:
-            Normalized string with only lowercase alphanumeric characters
-        """
-        # Remove all non-alphanumeric characters and convert to lowercase
-        return re.sub(r'[^a-z0-9]', '', text.lower())
-
-    def _find_title_end_position(self, text: str, title: str) -> int:
-        """
-        Find the end position of a normalized title in the original text.
-
-        Uses normalized comparison to match the title, then finds where it
-        actually ends in the original text (accounting for punctuation).
-
-        Args:
-            text: Text that may contain the title at the start
-            title: Title to find (will be normalized for comparison)
-
-        Returns:
-            Character position where the title ends, or 0 if not found
-        """
-        if not text or not title:
-            return 0
-
-        text_normalized = self._normalize_for_comparison(text)
-        title_normalized = self._normalize_for_comparison(title)
-
-        if not text_normalized.startswith(title_normalized):
-            return 0
-
-        # Find where the title ends by matching words
-        words = text.split()
-        title_words = title.split()
-
-        # Try to find the longest matching prefix
-        for n in range(min(len(words), len(title_words) + 10), 0, -1):
-            candidate = ' '.join(words[:n])
-            if self._normalize_for_comparison(candidate) == title_normalized:
-                # Found exact match - return the end position
-                candidate_text = ' '.join(words[:n])
-                # Find this in the original text (accounting for whitespace)
-                pos = text.find(candidate_text)
-                if pos != -1:
-                    return pos + len(candidate_text)
-                # Fallback: calculate approximate position
-                return len(candidate_text)
-
-        return 0
 
     def _is_header_paragraph(
         self, paragraph: List[Dict], baseline_font_size: float,
