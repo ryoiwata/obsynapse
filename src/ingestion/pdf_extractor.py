@@ -242,7 +242,7 @@ class PDFExtractor:
 
     def _ends_with_sentence_punctuation(self, text: str) -> bool:
         """
-        Check if text ends with sentence-terminal punctuation (. ! ?).
+        Check if text ends with sentence-terminal punctuation (. ! ? ").
 
         Args:
             text: Text to check
@@ -251,7 +251,7 @@ class PDFExtractor:
             True if text ends with sentence-terminal punctuation
         """
         text_stripped = text.rstrip()
-        return text_stripped.endswith(('.', '!', '?'))
+        return text_stripped.endswith(('.', '!', '?', '"'))
 
     def _should_merge_pages(
         self, last_paragraph: List[Dict], first_paragraph: List[Dict]
@@ -951,7 +951,7 @@ class PDFExtractor:
 
     def _paragraph_in_header_footer_zone(self, paragraph: List[Dict]) -> bool:
         """
-        Determine if a paragraph sits within the top/bottom 10% of the page.
+        Determine if a paragraph sits within the top/bottom 8% of the page.
         """
         if not paragraph:
             return False
@@ -966,72 +966,354 @@ class PDFExtractor:
             for block in paragraph
         )
 
-        top_zone = page_height * 0.10
-        bottom_zone = page_height * 0.90
+        top_zone = page_height * 0.08
+        bottom_zone = page_height * 0.92
 
         return y_top <= top_zone or y_top >= bottom_zone
 
-    def _remove_running_headers_by_position(
+    def _remove_running_headers_linguistic(
         self,
         page_paragraphs: List[List[List[Dict]]],
         headers_seen: Set[str]
     ) -> List[List[List[Dict]]]:
         """
-        Remove running headers/footers only when they are located in the
-        top/bottom 10% of the page and match known titles with pipe patterns.
+        Remove running headers/footers using linguistic heuristics
+        (no Y-coords).
+
+        Protections:
+        - Lowercase start = absolute shield (sentence continuation)
+        - Sentence continuity: if previous page ended mid-sentence, the first
+          paragraph on the next page has immunity unless it is a pure header.
+        - Header scalpel: regex-based removal of [Number] | [Known Title],
+          stripping only the matched header and preserving remainder.
+        - Strict known title check: only attempts removal when matching known
+          headers (headers_seen).
         """
         if not page_paragraphs or not headers_seen:
             return page_paragraphs
 
         filtered_pages: List[List[List[Dict]]] = []
+        is_sentence_open = False
 
         for page in page_paragraphs:
             filtered_paragraphs: List[List[Dict]] = []
+            is_first_paragraph = True
+
             for paragraph in page:
-                # Preserve immediately if no pipe present
                 paragraph_text = self._get_paragraph_text(paragraph)
+
+                # Lowercase shield
+                leading_alpha_match = re.search(r'[A-Za-z]', paragraph_text)
+                if leading_alpha_match:
+                    first_letter = paragraph_text[leading_alpha_match.start()]
+                    if first_letter.islower():
+                        filtered_paragraphs.append(paragraph)
+                        is_first_paragraph = False
+                        continue
+
+                # Continuity guard: first paragraph after open sentence
+                if is_first_paragraph and is_sentence_open:
+                    if '|' in paragraph_text:
+                        # Only drop if it's a pure header; otherwise keep
+                        if not self._is_pure_footer_pattern(
+                            paragraph_text, headers_seen
+                        ):
+                            filtered_paragraphs.append(paragraph)
+                            is_first_paragraph = False
+                            continue
+                    else:
+                        filtered_paragraphs.append(paragraph)
+                        is_first_paragraph = False
+                        continue
+
+                # If no pipe, keep
                 if '|' not in paragraph_text:
                     filtered_paragraphs.append(paragraph)
+                    is_first_paragraph = False
                     continue
 
-                # Require position within header/footer zones
-                if not self._paragraph_in_header_footer_zone(paragraph):
-                    filtered_paragraphs.append(paragraph)
-                    continue
-
-                # Require pipe pattern with page number
-                has_page_num = bool(re.search(r'\b\d{1,4}\b', paragraph_text))
-                if not has_page_num:
-                    filtered_paragraphs.append(paragraph)
-                    continue
-
-                # Check header match on either side of the pipe
-                left, right = paragraph_text.split('|', 1)
-                candidates = [
-                    self._normalize_text(
-                        self._strip_digits_and_separators(left)
-                    ),
-                    self._normalize_text(
-                        self._strip_digits_and_separators(right)
-                    )
-                ]
-                header_match = any(
-                    self._header_matches_seen(candidate, headers_seen)
-                    for candidate in candidates if candidate
+                # Apply header scalpel
+                scalpel_result = self._header_scalpel(
+                    paragraph_text, headers_seen
                 )
 
-                # Keep if no header match
-                if not header_match:
+                if scalpel_result is None:
                     filtered_paragraphs.append(paragraph)
-                    continue
+                elif scalpel_result == '':
+                    # Pure header - drop
+                    pass
+                else:
+                    # Replace first block text with remainder
+                    modified_paragraph = paragraph.copy()
+                    if modified_paragraph:
+                        modified_paragraph[0] = modified_paragraph[0].copy()
+                        modified_paragraph[0]['text'] = scalpel_result
+                    filtered_paragraphs.append(modified_paragraph)
 
-                # Drop this paragraph (running header/footer)
-                # No sticky state; decision is isolated to this paragraph
-                continue
+                is_first_paragraph = False
+
+            # Update sentence-open state using last kept paragraph
+            if filtered_paragraphs:
+                last_text = self._get_paragraph_text(filtered_paragraphs[-1])
+                # Open if hyphen-continued or missing terminal punctuation
+                is_sentence_open = (
+                    self._ends_with_hyphen(last_text) or
+                    not self._ends_with_sentence_punctuation(last_text)
+                )
+            else:
+                is_sentence_open = False
 
             filtered_pages.append(filtered_paragraphs)
 
         return filtered_pages
+
+    def _header_scalpel(
+        self, text: str, headers_seen: Set[str]
+    ) -> str | None:
+        """
+        Regex-based scalpel to remove [Number] | [Known Title] patterns while
+        preserving any trailing content.
+
+        Returns:
+            ''   if pure header (should be dropped)
+            str  if header removed and content preserved
+            None if no header match (keep original)
+        """
+        if '|' not in text:
+            return None
+
+        # Try each known header to build a scalpel pattern
+        for known_header in headers_seen:
+            header_tokens = known_header.split()
+            if not header_tokens:
+                continue
+
+            header_pattern = r'[\s\W]*'.join(
+                re.escape(token) for token in header_tokens
+            )
+
+            # Pattern 1: "42 | Chapter Title" or "42 | Chapter Title content"
+            pattern1 = (
+                r'^\s*(\d{1,4})\s*\|\s*'
+                r'(?:\d+\s*)?'        # Optional leading number
+                r'[\s\-–—:|]*'        # Optional separators
+                r'(' + header_pattern + r')'
+                r'[\s\-–—:|]*'        # Optional trailing separators
+            )
+
+            match = re.search(pattern1, text, re.IGNORECASE)
+            if match:
+                header_end = match.end()
+                remainder = text[header_end:].strip()
+                remainder = re.sub(r'^[\s\-–—:|]+', '', remainder)
+
+                matched_text = text[match.start():match.end()]
+                matched_clean = self._strip_digits_and_separators(matched_text)
+                matched_norm = self._normalize_text(matched_clean)
+                if matched_norm.startswith(known_header):
+                    if remainder:
+                        return remainder
+                    return ''
+
+            # Pattern 2: "Chapter Title | 42"
+            pattern2 = (
+                r'^(' + header_pattern + r')'
+                r'[\s\-–—:|]*'
+                r'\s*\|\s*(\d{1,4})\s*$'
+            )
+
+            match = re.search(pattern2, text, re.IGNORECASE)
+            if match:
+                return ''
+
+        return None
+
+    def _is_pure_footer_pattern(
+        self, text: str, headers_seen: Set[str]
+    ) -> bool:
+        """
+        Check if text matches a pure footer pattern: [Number] | [Title]
+        or [Title] | [Number] where Title exactly matches a known header.
+
+        Returns True only if the entire text is just the footer pattern
+        with no additional body content.
+        """
+        if '|' not in text:
+            return False
+
+        parts = text.split('|', 1)
+        if len(parts) != 2:
+            return False
+
+        left = parts[0].strip()
+        right = parts[1].strip()
+
+        # Check if one side is just a number
+        left_is_num = bool(re.fullmatch(r'\d{1,4}', left))
+        right_is_num = bool(re.fullmatch(r'\d{1,4}', right))
+
+        if left_is_num:
+            # Pattern: "42 | Title"
+            right_clean = self._strip_digits_and_separators(right)
+            right_norm = self._normalize_text(right_clean)
+            # Must be exact match (not substring) for pure footer
+            return right_norm in headers_seen
+
+        if right_is_num:
+            # Pattern: "Title | 42"
+            left_clean = self._strip_digits_and_separators(left)
+            left_norm = self._normalize_text(left_clean)
+            # Must be exact match (not substring) for pure footer
+            return left_norm in headers_seen
+
+        return False
+
+    def _strip_footer_if_pure_match(
+        self,
+        paragraph: List[Dict],
+        paragraph_text: str,
+        headers_seen: Set[str]
+    ) -> str | None:
+        """
+        If paragraph is a pure footer match, return '' to drop it.
+        If it's a partial match with extra content, use regex to strip just the
+        header portion and return the remainder. If no match, return None.
+
+        Uses regex-based pattern matching to handle cases like:
+        "14 | Chapter 1: Introduction... Figure 1-6..." where we strip
+        the header and keep "Figure 1-6...".
+
+        Returns:
+            '' if pure footer (should be dropped)
+            str if partial match (stripped remainder to keep)
+            None if no match (keep original)
+        """
+        if '|' not in paragraph_text:
+            return None
+
+        parts = paragraph_text.split('|', 1)
+        if len(parts) != 2:
+            return None
+
+        left = parts[0].strip()
+        right = parts[1].strip()
+
+        left_is_num = bool(re.fullmatch(r'\d{1,4}', left))
+        right_is_num = bool(re.fullmatch(r'\d{1,4}', right))
+
+        # Pattern: "42 | Title" or "42 | Title extra content"
+        if left_is_num:
+            # Remove leading page number from right side
+            right_after_num = re.sub(r'^\s*\d+\s*', '', right)
+            right_after_num = re.sub(r'^[\s\-–—:|]+', '', right_after_num)
+            right_clean = self._strip_digits_and_separators(right_after_num)
+            right_norm = self._normalize_text(right_clean)
+
+            # Check for exact match with known header
+            if right_norm in headers_seen:
+                # Pure footer - drop it
+                return ''
+
+            # Check if normalized text starts with a known header
+            for known_header in headers_seen:
+                if right_norm.startswith(known_header):
+                    # Partial match - use regex to strip header pattern
+                    # Build regex pattern to match: [number] | [header text]
+                    # The header text may have punctuation, so we need to
+                    # match it flexibly
+                    header_tokens = known_header.split()
+                    if header_tokens:
+                        # Create a pattern that matches the header with
+                        # flexible punctuation/whitespace
+                        header_pattern = r'[\s\W]*'.join(
+                            re.escape(token) for token in header_tokens
+                        )
+                        # Match: [number] | [optional spaces] [header pattern]
+                        full_pattern = (
+                            r'^\s*\d{1,4}\s*\|\s*'
+                            r'(?:\d+\s*)?'  # Optional leading number
+                            r'[\s\-–—:|]*'  # Optional separators
+                            r'(' + header_pattern + r')'
+                            r'[\s\-–—:|]*'  # Optional trailing separators
+                        )
+                        match = re.search(
+                            full_pattern, paragraph_text, re.IGNORECASE
+                        )
+                        if match:
+                            # Found the header pattern - extract everything
+                            # after it
+                            header_end = match.end()
+                            remainder = paragraph_text[header_end:].strip()
+                            remainder = re.sub(r'^[\s\-–—:|]+', '', remainder)
+                            if remainder:
+                                return remainder
+                    # Fallback: try to strip header prefix from right side
+                    if len(right_norm) > len(known_header) + 5:
+                        remainder = self._strip_header_prefix(
+                            right_after_num, known_header
+                        )
+                        remainder = remainder.strip()
+                        remainder = re.sub(r'^[\s\-–—:|]+', '', remainder)
+                        if remainder:
+                            return remainder
+                    # No substantial remainder - treat as pure footer
+                    return ''
+
+        # Pattern: "Title | 42" or "Title extra | 42"
+        if right_is_num:
+            left_clean = self._strip_digits_and_separators(left)
+            left_norm = self._normalize_text(left_clean)
+
+            # Check for exact match
+            if left_norm in headers_seen:
+                # Pure footer - drop it
+                return ''
+
+            # Check if left starts with a known header
+            for known_header in headers_seen:
+                if left_norm.startswith(known_header):
+                    # Partial match - use regex to strip header pattern
+                    header_tokens = known_header.split()
+                    if header_tokens:
+                        header_pattern = r'[\s\W]*'.join(
+                            re.escape(token) for token in header_tokens
+                        )
+                        # Match: [header pattern] [optional content] | [number]
+                        full_pattern = (
+                            r'^(' + header_pattern + r')'
+                            r'[\s\-–—:|]*'  # Optional separators
+                            r'.*?'  # Any content between header and pipe
+                            r'\s*\|\s*\d{1,4}\s*$'
+                        )
+                        match = re.search(
+                            full_pattern, paragraph_text, re.IGNORECASE
+                        )
+                        if match:
+                            # Extract content between header and pipe
+                            header_end = match.end(1)
+                            pipe_start = paragraph_text.rfind('|')
+                            if pipe_start > header_end:
+                                remainder = paragraph_text[
+                                    header_end:pipe_start
+                                ].strip()
+                                remainder = re.sub(
+                                    r'^[\s\-–—:|]+', '', remainder
+                                )
+                                if remainder:
+                                    return remainder
+                    # Fallback: try to extract remainder
+                    if len(left_norm) > len(known_header) + 5:
+                        remainder = self._strip_header_prefix(
+                            left, known_header
+                        )
+                        remainder = remainder.strip()
+                        remainder = re.sub(r'^[\s\-–—:|]+', '', remainder)
+                        if remainder:
+                            return remainder
+                    # No substantial remainder - treat as pure footer
+                    return ''
+
+        return None
 
     def extract(self) -> str:
         """
@@ -1086,8 +1368,8 @@ class PDFExtractor:
             page_paragraphs, baseline_font_size
         )
 
-        # Remove running headers/footers using positional awareness
-        page_paragraphs = self._remove_running_headers_by_position(
+        # Remove running headers/footers using linguistic heuristics
+        page_paragraphs = self._remove_running_headers_linguistic(
             page_paragraphs, known_headers
         )
 
@@ -1407,7 +1689,7 @@ def generate_output_path(input_path: str, output_arg: str = None) -> str:
     Priority:
     1) If output_arg is provided, return it unchanged.
     2) Otherwise, create/use an 'out' directory alongside the input PDF and
-       name the file as: YYYYMMDD_HHMMSS__INPUT_FILENAME__extracted.md
+       name the file as: INPUT_FILENAME__extracted__YYYYMMDD_HHMMSS.md
     """
     if output_arg:
         return output_arg
@@ -1422,7 +1704,7 @@ def generate_output_path(input_path: str, output_arg: str = None) -> str:
     out_dir = os.path.join(input_dir, 'out')
     os.makedirs(out_dir, exist_ok=True)
 
-    filename = f'{timestamp}__{stem_safe}__extracted.md'
+    filename = f'{stem_safe}__extracted__{timestamp}.md'
     return os.path.join(out_dir, filename)
 
 
@@ -1441,7 +1723,7 @@ def main():
         type=str,
         default=None,
         help='Path to save extracted text. If omitted, a path will be '
-             'generated as out/YYYYMMDD_HHMMSS__<pdf_name>__extracted.md '
+             'generated as out/<pdf_name>__extracted__YYYYMMDD_HHMMSS.md '
              'next to the PDF.'
     )
     parser.add_argument(
