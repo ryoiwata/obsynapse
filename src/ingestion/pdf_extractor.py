@@ -53,7 +53,11 @@ class PDFExtractor:
         font_lower = font_name.lower()
         return any(mono in font_lower for mono in self.MONOSPACED_FONTS)
 
-    def _extract_text_blocks(self, page) -> List[Dict]:
+    def _extract_text_blocks(
+        self,
+        page,
+        table_bboxes: List[Tuple[float, float, float, float]] = None
+    ) -> List[Dict]:
         """
         Extract text blocks from a page using get_text('dict').
 
@@ -73,13 +77,17 @@ class PDFExtractor:
 
             for line in block.get('lines', []):
                 for span in line.get('spans', []):
+                    # Get position (bbox Y-coordinate for reading order)
+                    bbox = span.get('bbox', [0, 0, 0, 0])
+                    y_pos = bbox[1]  # Top Y coordinate
+
                     text = span.get('text', '').strip()
                     if not text:
                         continue
 
-                    # Get position (bbox Y-coordinate for reading order)
-                    bbox = span.get('bbox', [0, 0, 0, 0])
-                    y_pos = bbox[1]  # Top Y coordinate
+                    # Skip spans that lie inside detected table regions
+                    if table_bboxes and self._bbox_in_any(bbox, table_bboxes):
+                        continue
 
                     # Check if text is bold
                     # PyMuPDF flags: bit 4 (16) indicates bold
@@ -971,6 +979,45 @@ class PDFExtractor:
 
         return y_top <= top_zone or y_top >= bottom_zone
 
+    def _get_table_bboxes(
+        self, page
+    ) -> List[Tuple[float, float, float, float]]:
+        """
+        Detect table bounding boxes on a page using PyMuPDF find_tables().
+        """
+        try:
+            tables = page.find_tables()
+        except Exception:
+            return []
+
+        if not tables:
+            return []
+
+        bboxes = []
+        for tbl in getattr(tables, 'tables', []):
+            if hasattr(tbl, 'bbox'):
+                bboxes.append(tuple(tbl.bbox))
+        return bboxes
+
+    def _bbox_in_any(
+        self,
+        bbox: List[float],
+        bboxes: List[Tuple[float, float, float, float]]
+    ) -> bool:
+        """
+        Check if a bbox center lies inside any bbox in the provided list.
+        """
+        if not bbox or not bboxes:
+            return False
+        x0, y0, x1, y1 = bbox
+        cx = (x0 + x1) / 2
+        cy = (y0 + y1) / 2
+        for tb in bboxes:
+            tx0, ty0, tx1, ty1 = tb
+            if tx0 <= cx <= tx1 and ty0 <= cy <= ty1:
+                return True
+        return False
+
     def _remove_running_headers_linguistic(
         self,
         page_paragraphs: List[List[List[Dict]]],
@@ -1065,6 +1112,55 @@ class PDFExtractor:
 
             filtered_pages.append(filtered_paragraphs)
 
+        return filtered_pages
+
+    def _strip_table_caption_text(self, text: str) -> Tuple[bool, str]:
+        """
+        Detect and optionally strip table caption prefixes.
+
+        Returns:
+            (dropped, new_text)
+            - dropped=True if entire line should be removed
+            - new_text is the possibly stripped text
+        """
+        if not text:
+            return False, text
+
+        caption_pattern = re.compile(
+            r'^\s*table\s+\d+(?:[-.]\d+)?[:.]?\s*', re.IGNORECASE
+        )
+        if not caption_pattern.match(text):
+            return False, text
+
+        # If caption only, drop
+        stripped = caption_pattern.sub('', text).strip()
+        if not stripped:
+            return True, ''
+        # Caption glued with body content - keep remainder
+        return False, stripped
+
+    def _remove_table_captions(
+        self, page_paragraphs: List[List[List[Dict]]]
+    ) -> List[List[List[Dict]]]:
+        """
+        Remove table captions or strip caption prefixes while preserving body.
+        """
+        filtered_pages: List[List[List[Dict]]] = []
+        for page in page_paragraphs:
+            filtered_paragraphs: List[List[Dict]] = []
+            for paragraph in page:
+                para_text = self._get_paragraph_text(paragraph)
+                drop, new_text = self._strip_table_caption_text(para_text)
+                if drop:
+                    continue
+                if new_text != para_text and paragraph:
+                    modified_paragraph = paragraph.copy()
+                    modified_paragraph[0] = modified_paragraph[0].copy()
+                    modified_paragraph[0]['text'] = new_text
+                    filtered_paragraphs.append(modified_paragraph)
+                else:
+                    filtered_paragraphs.append(paragraph)
+            filtered_pages.append(filtered_paragraphs)
         return filtered_pages
 
     def _header_scalpel(
@@ -1344,8 +1440,11 @@ class PDFExtractor:
         for page_num in range(len(self.doc)):
             page = self.doc[page_num]
 
+            # Detect table regions on this page
+            table_bboxes = self._get_table_bboxes(page)
+
             # Extract blocks from this page
-            blocks = self._extract_text_blocks(page)
+            blocks = self._extract_text_blocks(page, table_bboxes)
             all_blocks.extend(blocks)  # Collect for baseline calculation
 
             # Sort blocks by position (within this page only)
@@ -1372,6 +1471,9 @@ class PDFExtractor:
         page_paragraphs = self._remove_running_headers_linguistic(
             page_paragraphs, known_headers
         )
+
+        # Remove table captions (strip or drop)
+        page_paragraphs = self._remove_table_captions(page_paragraphs)
 
         # Merge paragraphs across page boundaries where appropriate
         merged_paragraphs = self._merge_pages_paragraphs(page_paragraphs)
