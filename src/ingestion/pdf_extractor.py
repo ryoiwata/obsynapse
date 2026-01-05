@@ -64,6 +64,7 @@ class PDFExtractor:
             List of text block dictionaries with position and formatting info
         """
         text_dict = page.get_text('dict')
+        page_height = getattr(page, 'rect', None).height if page else None
         blocks = []
 
         for block in text_dict.get('blocks', []):
@@ -95,6 +96,7 @@ class PDFExtractor:
                         'font_size': span.get('size', 0),
                         'y_pos': y_pos,
                         'bbox': bbox,
+                        'page_height': page_height,
                         'is_monospaced': self._is_monospaced_font(
                             span.get('font', '')
                         ),
@@ -912,6 +914,125 @@ class PDFExtractor:
 
         return '\n'.join(cleaned)
 
+    def _collect_known_headers(
+        self,
+        page_paragraphs: List[List[List[Dict]]],
+        baseline_font_size: float
+    ) -> Set[str]:
+        """
+        Collect normalized header titles from paragraph structures using
+        the existing header detection heuristic.
+        """
+        headers: Set[str] = set()
+        prev_paragraph = None
+
+        for page in page_paragraphs:
+            for paragraph in page:
+                # Skip monospaced paragraphs from header consideration
+                paragraph_is_monospaced = any(
+                    block.get('is_monospaced', False) for block in paragraph
+                )
+                if paragraph_is_monospaced:
+                    prev_paragraph = paragraph
+                    continue
+
+                is_header, _ = self._is_header_paragraph(
+                    paragraph, baseline_font_size, prev_paragraph
+                )
+                if is_header:
+                    title = self._get_paragraph_text(paragraph)
+                    title_norm = self._normalize_text(title)
+                    if title_norm:
+                        headers.add(title_norm)
+
+                prev_paragraph = paragraph
+
+        return headers
+
+    def _paragraph_in_header_footer_zone(self, paragraph: List[Dict]) -> bool:
+        """
+        Determine if a paragraph sits within the top/bottom 10% of the page.
+        """
+        if not paragraph:
+            return False
+
+        first_block = paragraph[0]
+        page_height = first_block.get('page_height')
+        if not page_height:
+            return False
+
+        y_top = min(
+            block.get('bbox', [0, 0, 0, 0])[1]
+            for block in paragraph
+        )
+
+        top_zone = page_height * 0.10
+        bottom_zone = page_height * 0.90
+
+        return y_top <= top_zone or y_top >= bottom_zone
+
+    def _remove_running_headers_by_position(
+        self,
+        page_paragraphs: List[List[List[Dict]]],
+        headers_seen: Set[str]
+    ) -> List[List[List[Dict]]]:
+        """
+        Remove running headers/footers only when they are located in the
+        top/bottom 10% of the page and match known titles with pipe patterns.
+        """
+        if not page_paragraphs or not headers_seen:
+            return page_paragraphs
+
+        filtered_pages: List[List[List[Dict]]] = []
+
+        for page in page_paragraphs:
+            filtered_paragraphs: List[List[Dict]] = []
+            for paragraph in page:
+                # Preserve immediately if no pipe present
+                paragraph_text = self._get_paragraph_text(paragraph)
+                if '|' not in paragraph_text:
+                    filtered_paragraphs.append(paragraph)
+                    continue
+
+                # Require position within header/footer zones
+                if not self._paragraph_in_header_footer_zone(paragraph):
+                    filtered_paragraphs.append(paragraph)
+                    continue
+
+                # Require pipe pattern with page number
+                has_page_num = bool(re.search(r'\b\d{1,4}\b', paragraph_text))
+                if not has_page_num:
+                    filtered_paragraphs.append(paragraph)
+                    continue
+
+                # Check header match on either side of the pipe
+                left, right = paragraph_text.split('|', 1)
+                candidates = [
+                    self._normalize_text(
+                        self._strip_digits_and_separators(left)
+                    ),
+                    self._normalize_text(
+                        self._strip_digits_and_separators(right)
+                    )
+                ]
+                header_match = any(
+                    self._header_matches_seen(candidate, headers_seen)
+                    for candidate in candidates if candidate
+                )
+
+                # Keep if no header match
+                if not header_match:
+                    filtered_paragraphs.append(paragraph)
+                    continue
+
+                # Drop this paragraph (running header/footer)
+                # No sticky state; decision is isolated to this paragraph
+                continue
+
+            filtered_pages.append(filtered_paragraphs)
+
+        return filtered_pages
+
     def extract(self) -> str:
         """
         Extract text from the PDF and return as Markdown-lite string.
@@ -956,6 +1077,19 @@ class PDFExtractor:
             # Store paragraphs for this page (not yet converted to markdown)
             if paragraphs:
                 page_paragraphs.append(paragraphs)
+
+        # Calculate baseline font size for header detection
+        baseline_font_size = self._calculate_baseline_font_size(all_blocks)
+
+        # Collect known headers from the document for positional filtering
+        known_headers = self._collect_known_headers(
+            page_paragraphs, baseline_font_size
+        )
+
+        # Remove running headers/footers using positional awareness
+        page_paragraphs = self._remove_running_headers_by_position(
+            page_paragraphs, known_headers
+        )
 
         # Merge paragraphs across page boundaries where appropriate
         merged_paragraphs = self._merge_pages_paragraphs(page_paragraphs)
