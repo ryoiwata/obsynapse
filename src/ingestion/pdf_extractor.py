@@ -1399,6 +1399,33 @@ def setup_logging(
     return logger
 
 
+def generate_output_path(input_path: str, output_arg: str = None) -> str:
+    """
+    Generate the output path for extracted markdown following a standardized
+    convention.
+
+    Priority:
+    1) If output_arg is provided, return it unchanged.
+    2) Otherwise, create/use an 'out' directory alongside the input PDF and
+       name the file as: YYYYMMDD_HHMMSS__INPUT_FILENAME__extracted.md
+    """
+    if output_arg:
+        return output_arg
+
+    timestamp = get_timestamp()
+    input_dir = os.path.dirname(input_path) or '.'
+    input_basename = os.path.basename(input_path)
+    stem, _ = os.path.splitext(input_basename)
+    # Replace whitespace with underscores to avoid spaces
+    stem_safe = re.sub(r'\s+', '_', stem)
+
+    out_dir = os.path.join(input_dir, 'out')
+    os.makedirs(out_dir, exist_ok=True)
+
+    filename = f'{timestamp}__{stem_safe}__extracted.md'
+    return os.path.join(out_dir, filename)
+
+
 def main():
     """Main entry point for PDF extraction CLI."""
     parser = argparse.ArgumentParser(
@@ -1413,9 +1440,9 @@ def main():
         '--output',
         type=str,
         default=None,
-        help='Path to save extracted text (default: print to stdout). '
-             'If directory does not exist, it will be created. '
-             'Timestamp will be prepended to filename if not specified.'
+        help='Path to save extracted text. If omitted, a path will be '
+             'generated as out/YYYYMMDD_HHMMSS__<pdf_name>__extracted.md '
+             'next to the PDF.'
     )
     parser.add_argument(
         '--log-file',
@@ -1439,9 +1466,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Generate timestamp for this run
-    timestamp = get_timestamp()
-
     # Set up logging with organized directory structure
     logger = setup_logging(args.log_dir, args.log_file)
 
@@ -1449,9 +1473,9 @@ def main():
         logger.info(f'Starting PDF extraction from: {args.pdf_path}')
         logger.debug(f'Log directory: {args.log_dir}')
         if args.output:
-            logger.debug(f'Output file: {args.output}')
+            logger.debug(f'Output file (user provided): {args.output}')
         else:
-            logger.debug('Output: stdout (piping mode)')
+            logger.debug('Output file: auto-generated in out/ next to PDF')
 
         # Extract text from PDF
         with PDFExtractor(args.pdf_path) as extractor:
@@ -1465,37 +1489,22 @@ def main():
 
         # Write output to file or stdout
         try:
-            if args.output:
-                # Determine output path with timestamp if needed
-                output_path = args.output
-                if not args.no_timestamp_output:
-                    # Add timestamp to filename
-                    dirname = os.path.dirname(output_path) or '.'
-                    basename = os.path.basename(output_path)
-                    name, ext = os.path.splitext(basename)
-                    if not ext:
-                        ext = '.md'  # Default to .md if no extension
-                    timestamped_basename = f'{timestamp}_{name}{ext}'
-                    output_path = os.path.join(dirname, timestamped_basename)
+            output_path = generate_output_path(args.pdf_path, args.output)
 
-                # Create output directory if it doesn't exist
-                output_dir = os.path.dirname(output_path)
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                    logger.debug(f'Created output directory: {output_dir}')
+            # Create output directory if it doesn't exist
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                logger.debug(f'Created output directory: {output_dir}')
 
-                # Write file
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(extracted_text)
-                logger.info(
-                    f'Extraction complete. '
-                    f'Character count: {char_count:,}'
-                )
-                logger.info(f'Output saved to: {output_path}')
-            else:
-                # Print to stdout for piping (only when --output is None)
-                sys.stdout.write(extracted_text)
-                logger.debug('Extracted text written to stdout')
+            # Write file
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(extracted_text)
+            logger.info(
+                f'Extraction complete. '
+                f'Character count: {char_count:,}'
+            )
+            logger.info(f'Output saved to: {output_path}')
         except Exception as write_error:
             logger.exception(
                 f'Error writing output file: {str(write_error)}'
