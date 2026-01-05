@@ -874,6 +874,44 @@ class PDFExtractor:
 
         return '\n'.join(cleaned)
 
+    def _remove_numbered_paragraphs(self, markdown_text: str) -> str:
+        """
+        Drop entire paragraphs that begin with a bare numeric prefix like
+        '2 For ...' (digits + space + letter). Skips markdown headers and
+        fenced code blocks.
+        """
+        if not markdown_text:
+            return markdown_text
+
+        lines = markdown_text.split('\n')
+        cleaned: List[str] = []
+        in_code_block = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Preserve and track fenced code blocks
+            if stripped.startswith('```'):
+                in_code_block = not in_code_block
+                cleaned.append(line)
+                continue
+            if in_code_block:
+                cleaned.append(line)
+                continue
+
+            # Preserve markdown headers
+            if self._is_markdown_header_line(line):
+                cleaned.append(line)
+                continue
+
+            # Drop paragraphs that start with: 1–2 digits + space + letter
+            if re.match(r'^\s*\d{1,2}\s+[A-Za-z]', line):
+                continue
+
+            cleaned.append(line)
+
+        return '\n'.join(cleaned)
+
     def extract(self) -> str:
         """
         Extract text from the PDF and return as Markdown-lite string.
@@ -938,6 +976,9 @@ class PDFExtractor:
         markdown_text = self._remove_leading_page_number_prefixes(
             markdown_text
         )
+
+        # Drop paragraphs starting with bare numeric prefixes
+        markdown_text = self._remove_numbered_paragraphs(markdown_text)
 
         return markdown_text
 
